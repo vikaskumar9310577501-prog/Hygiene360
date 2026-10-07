@@ -1,0 +1,582 @@
+import React, { useState } from 'react';
+import { useAuth } from '../context/AuthContext';
+import { 
+  ShieldCheck, Lock, Mail, AlertCircle, ArrowRight, 
+  CheckCircle2, RefreshCw, ArrowLeft, Sparkles, Eye, EyeOff
+} from 'lucide-react';
+
+export default function Login() {
+  const { login, sendOtp, loginWithOtp } = useAuth();
+  
+  // Auth Mode: 'otp' (default) | 'password'
+  const [authMode, setAuthMode] = useState('otp');
+  
+  // OTP flow state: step 1 = enter email, step 2 = enter otp
+  const [step, setStep] = useState(1);
+  const [email, setEmail] = useState('');
+  const [otp, setOtp] = useState('');
+  const [emailStatus, setEmailStatus] = useState(null);
+  const [verifiedUserInfo, setVerifiedUserInfo] = useState(null);
+  
+  // Password flow state
+  const [password, setPassword] = useState('');
+  
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Step 1: Send OTP to Registered Corporate Email
+  const handleSendOtp = async (e) => {
+    e?.preventDefault();
+    if (!email || !email.trim()) {
+      setError('Please enter your registered corporate email address.');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setSuccessMsg(null);
+
+    try {
+      const res = await sendOtp(email.trim().toLowerCase());
+      setVerifiedUserInfo(res.user);
+      setEmailStatus(res);
+      setSuccessMsg(res.message || `OTP sent to ${res.email || email}`);
+      setStep(2);
+    } catch (err) {
+      const errMsg = err.data?.error || err.message || 'Invalid email address. Access denied. Please contact your IT Admin.';
+      setError(errMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Step 2: Verify OTP and Login
+  const handleVerifyOtp = async (e) => {
+    e?.preventDefault();
+    if (!otp || otp.trim().length < 4) {
+      setError('Please enter the 6-digit OTP verification code.');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      await loginWithOtp(email.trim().toLowerCase(), otp.trim());
+    } catch (err) {
+      setError(err.data?.error || err.message || 'Invalid or expired OTP. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Password Login Handler (Fallback)
+  const handlePasswordLogin = async (e) => {
+    e.preventDefault();
+    if (!email || !password) return;
+
+    setLoading(true);
+    setError(null);
+    try {
+      await login(email.trim().toLowerCase(), password);
+    } catch (err) {
+      setError(err.data?.error || err.message || 'Login failed. Please check credentials or contact IT Admin.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      minHeight: '100vh',
+      backgroundColor: '#f8fafc',
+      backgroundImage: 'radial-gradient(#e2e8f0 1.2px, transparent 1.2px)',
+      backgroundSize: '24px 24px',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: '24px 16px',
+      boxSizing: 'border-box',
+      fontFamily: 'var(--font-sans, system-ui, -apple-system, sans-serif)'
+    }}>
+      <div style={{ width: '100%', maxWidth: '420px' }}>
+        
+        {/* Brand Header */}
+        <div style={{ textAlign: 'center', marginBottom: '24px' }}>
+          <div style={{
+            width: '60px',
+            height: '60px',
+            borderRadius: '16px',
+            backgroundColor: '#ffffff',
+            border: '1px solid #e2e8f0',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#0284c7',
+            marginBottom: '14px',
+            boxShadow: '0 8px 20px -4px rgba(2, 132, 199, 0.15), 0 2px 6px rgba(0, 0, 0, 0.04)'
+          }}>
+            <ShieldCheck size={34} strokeWidth={2.4} />
+          </div>
+          
+          <h1 style={{ 
+            fontSize: '25px', 
+            fontWeight: '900', 
+            letterSpacing: '-0.03em', 
+            color: '#0f172a', 
+            margin: '0 0 6px 0' 
+          }}>
+            HYGIENE 360
+          </h1>
+          
+          <div style={{ 
+            display: 'inline-flex', 
+            alignItems: 'center', 
+            gap: '6px', 
+            fontSize: '11.5px', 
+            fontWeight: '700', 
+            color: '#0369a1',
+            backgroundColor: '#f0f9ff',
+            padding: '3px 10px',
+            borderRadius: '20px',
+            border: '1px solid #bae6fd'
+          }}>
+            <Building2 size={12} />
+            <span>PG Electroplast Limited</span>
+          </div>
+
+          <p style={{ fontSize: '13px', color: '#64748b', marginTop: '8px', lineHeight: '1.4' }}>
+            Enterprise Housekeeping & Facility Management System
+          </p>
+        </div>
+
+        {/* Clean White Login Card */}
+        <div style={{
+          backgroundColor: '#ffffff',
+          borderRadius: '20px',
+          border: '1px solid #e2e8f0',
+          padding: '28px 24px',
+          boxShadow: '0 20px 45px -12px rgba(15, 23, 42, 0.08), 0 4px 12px -2px rgba(15, 23, 42, 0.03)'
+        }}>
+
+          {/* Form Header Title */}
+          <div style={{ marginBottom: '20px', textAlign: 'center' }}>
+            <h2 style={{ fontSize: '17px', fontWeight: '800', color: '#0f172a', margin: '0 0 4px 0' }}>
+              {authMode === 'otp' ? 'Secure OTP Sign In' : 'Account Password Sign In'}
+            </h2>
+            <p style={{ fontSize: '12.5px', color: '#64748b', margin: 0 }}>
+              {authMode === 'otp' 
+                ? (step === 1 ? 'Enter your registered email to receive OTP' : 'Enter 6-digit verification passcode')
+                : 'Enter your credentials to access portal'
+              }
+            </p>
+          </div>
+
+          {/* Error Banner */}
+          {error && (
+            <div style={{
+              padding: '12px 14px',
+              borderRadius: '12px',
+              backgroundColor: '#fef2f2',
+              color: '#991b1b',
+              border: '1px solid #fecaca',
+              marginBottom: '18px',
+              fontSize: '12.5px',
+              lineHeight: '1.45',
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: '10px'
+            }}>
+              <AlertCircle size={18} style={{ flexShrink: 0, marginTop: '2px', color: '#dc2626' }} />
+              <div>
+                <strong style={{ color: '#7f1d1d', display: 'block', marginBottom: '2px' }}>Access Denied</strong>
+                {error}
+                <div style={{ fontSize: '11px', color: '#b91c1c', marginTop: '4px' }}>
+                  💡 केवल User Management में रजिस्टर्ड यूज़र्स ही लॉगिन कर सकते हैं। अपने IT Admin से संपर्क करें।
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* OTP FLOW (PRIMARY) */}
+          {authMode === 'otp' && (
+            <div>
+              {step === 1 ? (
+                /* Step 1: Enter Registered Email */
+                <form onSubmit={handleSendOtp} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', fontWeight: '700', color: '#334155', marginBottom: '6px' }}>
+                      Corporate Email / Employee ID / Phone *
+                    </label>
+                    <div style={{ position: 'relative' }}>
+                      <Mail size={16} color="#94a3b8" style={{ position: 'absolute', left: '13px', top: '13px' }} />
+                      <input
+                        type="text"
+                        style={{
+                          width: '100%',
+                          height: '42px',
+                          padding: '8px 12px 8px 38px',
+                          borderRadius: '10px',
+                          border: '1.5px solid #cbd5e1',
+                          backgroundColor: '#ffffff',
+                          color: '#0f172a',
+                          fontSize: '13.5px',
+                          outline: 'none',
+                          boxSizing: 'border-box',
+                          transition: 'border-color 0.15s ease'
+                        }}
+                        onFocus={(e) => e.target.style.borderColor = '#0284c7'}
+                        onBlur={(e) => e.target.style.borderColor = '#cbd5e1'}
+                        placeholder="e.g. himanshu121106@gmail.com or NGM00138"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        autoFocus
+                        required
+                      />
+                    </div>
+                    <div style={{ fontSize: '11px', color: '#64748b', marginTop: '5px' }}>
+                      Apna registered Email, Employee ID (jaise NGM00138) ya Mobile number daalein.
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={loading || !email.trim()}
+                    style={{
+                      width: '100%',
+                      height: '44px',
+                      backgroundColor: '#0284c7',
+                      backgroundImage: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
+                      color: '#ffffff',
+                      border: 'none',
+                      borderRadius: '10px',
+                      fontSize: '14px',
+                      fontWeight: '700',
+                      cursor: loading || !email.trim() ? 'not-allowed' : 'pointer',
+                      opacity: loading || !email.trim() ? 0.65 : 1,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '8px',
+                      boxShadow: '0 4px 14px rgba(2, 132, 199, 0.25)',
+                      transition: 'all 0.15s ease'
+                    }}
+                  >
+                    <span>{loading ? 'Validating User ID...' : 'Send Login OTP'}</span>
+                    <ArrowRight size={17} />
+                  </button>
+                </form>
+              ) : (
+                /* Step 2: Enter 6-Digit OTP */
+                <form onSubmit={handleVerifyOtp} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  {/* Verified User Details Header */}
+                  <div style={{
+                    backgroundColor: '#f8fafc',
+                    borderRadius: '12px',
+                    padding: '10px 14px',
+                    border: '1px solid #e2e8f0',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between'
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <div style={{
+                        width: '34px',
+                        height: '34px',
+                        borderRadius: '10px',
+                        backgroundColor: '#0284c7',
+                        color: '#ffffff',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontWeight: '800',
+                        fontSize: '14px'
+                      }}>
+                        {verifiedUserInfo?.name?.charAt(0) || 'U'}
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '13px', fontWeight: '800', color: '#0f172a' }}>
+                          {verifiedUserInfo?.name || 'Staff User'}
+                        </div>
+                        <div style={{ fontSize: '11px', color: '#64748b' }}>
+                          {verifiedUserInfo?.employee_id} • {email}
+                        </div>
+                      </div>
+                    </div>
+                    <span style={{
+                      fontSize: '10.5px',
+                      fontWeight: '800',
+                      padding: '2px 8px',
+                      borderRadius: '6px',
+                      backgroundColor: '#e0f2fe',
+                      color: '#0369a1'
+                    }}>
+                      {verifiedUserInfo?.role?.replace('_', ' ') || 'ACTIVE'}
+                    </span>
+                  </div>
+
+                  {/* Secure Email Dispatched Notice */}
+                  <div style={{
+                    backgroundColor: '#f0fdf4',
+                    border: '1.5px solid #bbf7d0',
+                    borderRadius: '12px',
+                    padding: '13px 15px',
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: '11px',
+                    boxShadow: '0 2px 6px rgba(22, 163, 74, 0.04)'
+                  }}>
+                    <div style={{
+                      width: '32px',
+                      height: '32px',
+                      borderRadius: '8px',
+                      backgroundColor: '#dcfce7',
+                      color: '#16a34a',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      flexShrink: 0
+                    }}>
+                      <Mail size={17} strokeWidth={2.4} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: '12.5px', fontWeight: '800', color: '#166534', display: 'flex', alignItems: 'center', gap: '5px' }}>
+                        <span>OTP Sent to Registered Email</span>
+                        <CheckCircle2 size={13} color="#16a34a" />
+                      </div>
+                      <div style={{ fontSize: '12px', color: '#15803d', marginTop: '3px', lineHeight: '1.45' }}>
+                        A 6-digit passcode has been sent to:
+                        <br />
+                        <span style={{ fontWeight: '800', color: '#14532d', fontSize: '12.5px', wordBreak: 'break-all' }}>
+                          {verifiedUserInfo?.email || email}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#166534', marginTop: '6px', opacity: 0.9 }}>
+                        📬 Please check your <strong>Inbox</strong> and <strong>Spam / Junk</strong> folder.
+                      </div>
+                      {emailStatus?.emailUnconfigured && (
+                        <div style={{
+                          marginTop: '8px',
+                          padding: '6px 8px',
+                          backgroundColor: '#fef3c7',
+                          border: '1px solid #fde68a',
+                          borderRadius: '6px',
+                          fontSize: '11px',
+                          color: '#92400e',
+                          lineHeight: '1.35'
+                        }}>
+                          ℹ️ SMTP setup pending in <code>.env</code>. You can use master passcode <strong>123456</strong> or check server console for OTP.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label style={{ display: 'block', fontSize: '12.5px', fontWeight: '700', color: '#334155', marginBottom: '6px' }}>
+                      Enter 6-Digit Passcode *
+                    </label>
+                    <input
+                      type="text"
+                      style={{
+                        width: '100%',
+                        height: '50px',
+                        backgroundColor: '#ffffff',
+                        border: '2px solid #0284c7',
+                        borderRadius: '12px',
+                        color: '#0f172a',
+                        textAlign: 'center',
+                        fontSize: '24px',
+                        fontWeight: '900',
+                        letterSpacing: '10px',
+                        fontFamily: 'var(--font-mono, monospace)',
+                        outline: 'none',
+                        boxSizing: 'border-box'
+                      }}
+                      placeholder="••••••"
+                      maxLength={6}
+                      value={otp}
+                      onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      autoFocus
+                      required
+                    />
+
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px', fontSize: '12px' }}>
+                      <button
+                        type="button"
+                        onClick={() => { setStep(1); setOtp(''); setError(null); }}
+                        style={{ border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', padding: 0 }}
+                      >
+                        <ArrowLeft size={13} />
+                        <span>Change Email</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleSendOtp}
+                        disabled={loading}
+                        style={{ border: 'none', background: 'transparent', color: '#0284c7', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px', padding: 0, fontWeight: '700' }}
+                      >
+                        <RefreshCw size={12} />
+                        <span>Resend OTP</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={loading || otp.length < 4}
+                    style={{
+                      width: '100%',
+                      height: '46px',
+                      backgroundColor: '#0284c7',
+                      backgroundImage: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
+                      color: '#ffffff',
+                      border: 'none',
+                      borderRadius: '10px',
+                      fontSize: '14px',
+                      fontWeight: '800',
+                      cursor: loading || otp.length < 4 ? 'not-allowed' : 'pointer',
+                      opacity: loading || otp.length < 4 ? 0.65 : 1,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '8px',
+                      boxShadow: '0 4px 14px rgba(2, 132, 199, 0.25)',
+                      transition: 'all 0.15s ease'
+                    }}
+                  >
+                    <span>{loading ? 'Verifying Passcode...' : 'Verify OTP & Enter App'}</span>
+                    <CheckCircle2 size={18} />
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
+
+          {/* PASSWORD FLOW (FALLBACK) */}
+          {authMode === 'password' && (
+            <form onSubmit={handlePasswordLogin} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '12.5px', fontWeight: '700', color: '#334155', marginBottom: '6px' }}>
+                  Corporate Email Address *
+                </label>
+                <div style={{ position: 'relative' }}>
+                  <Mail size={16} color="#94a3b8" style={{ position: 'absolute', left: '13px', top: '13px' }} />
+                  <input
+                    type="email"
+                    style={{
+                      width: '100%',
+                      height: '42px',
+                      padding: '8px 12px 8px 38px',
+                      borderRadius: '10px',
+                      border: '1.5px solid #cbd5e1',
+                      backgroundColor: '#ffffff',
+                      color: '#0f172a',
+                      fontSize: '13.5px',
+                      outline: 'none',
+                      boxSizing: 'border-box'
+                    }}
+                    placeholder="name@hygiene360.com"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    required
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '12.5px', fontWeight: '700', color: '#334155', marginBottom: '6px' }}>
+                  Password *
+                </label>
+                <div style={{ position: 'relative' }}>
+                  <Lock size={16} color="#94a3b8" style={{ position: 'absolute', left: '13px', top: '13px' }} />
+                  <input
+                    type="password"
+                    style={{
+                      width: '100%',
+                      height: '42px',
+                      padding: '8px 12px 8px 38px',
+                      borderRadius: '10px',
+                      border: '1.5px solid #cbd5e1',
+                      backgroundColor: '#ffffff',
+                      color: '#0f172a',
+                      fontSize: '13.5px',
+                      outline: 'none',
+                      boxSizing: 'border-box'
+                    }}
+                    placeholder="••••••••"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                  />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                style={{
+                  width: '100%',
+                  height: '44px',
+                  backgroundColor: '#0284c7',
+                  backgroundImage: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '10px',
+                  fontSize: '14px',
+                  fontWeight: '700',
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  boxShadow: '0 4px 14px rgba(2, 132, 199, 0.25)'
+                }}
+              >
+                <span>{loading ? 'Authenticating...' : 'Sign In with Password'}</span>
+                <ArrowRight size={17} />
+              </button>
+            </form>
+          )}
+
+          {/* Toggle between OTP and Password login */}
+          <div style={{ marginTop: '20px', textAlign: 'center', borderTop: '1px solid #f1f5f9', paddingTop: '14px' }}>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthMode(authMode === 'otp' ? 'password' : 'otp');
+                setError(null);
+              }}
+              style={{
+                border: 'none',
+                background: 'transparent',
+                color: '#64748b',
+                fontSize: '12px',
+                fontWeight: '600',
+                cursor: 'pointer',
+                textDecoration: 'underline'
+              }}
+            >
+              {authMode === 'otp' ? 'Sign in using password instead' : '← Back to Email OTP sign in'}
+            </button>
+          </div>
+
+        </div>
+
+        {/* Security Footer Notice */}
+        <div style={{ textAlign: 'center', marginTop: '24px' }}>
+          <p style={{ fontSize: '11px', color: '#94a3b8', margin: '0 0 4px 0' }}>
+            🔒 Authorized Personnel Only • Protected by 2FA Cryptographic Tokens
+          </p>
+          <p style={{ fontSize: '10.5px', color: '#cbd5e1', margin: 0 }}>
+            © {new Date().getFullYear()} PG Electroplast Limited. All rights reserved.
+          </p>
+        </div>
+
+      </div>
+    </div>
+  );
+}

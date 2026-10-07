@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+client/dist/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.pfx
+
+# Local database (contains real users / password hashes)
+server/*.db
+server/*.db-shm
+server/*.db-wal
+*.sqlite
+
+# Uploaded photos
+uploads/
+server/uploads/
+
+# Logs / OS / editor
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temp lint configs
+client/eslint.*.tmp.mjs
