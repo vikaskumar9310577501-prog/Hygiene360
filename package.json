@@ -6,15 +6,20 @@
   "scripts": {
     "dev": "concurrently -n \"SERVER,CLIENT,FWD\" -c \"blue,green,magenta\" \"node --watch server/index.js\" \"npm.cmd --prefix client run dev\" \"node server/forwarder3001.js\"",
     "start": "node server/index.js",
-    "build": "npm.cmd --prefix client run build",
+    "build": "npm --prefix client run build",
     "seed": "node server/seed.js",
+    "migrate:supabase": "node server/scripts/migrate-to-supabase.js",
     "test": "node test/backend-test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": "22.x"
+  },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
     "@techstark/opencv-js": "^4.10.0-release.1",
     "bcryptjs": "^3.0.3",
     "concurrently": "^10.0.5",
@@ -25,6 +30,7 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.4.0",
     "nodemailer": "^10.0.11",
+    "pg": "^8.23.1",
     "qrcode": "^1.5.4",
     "tesseract.js": "^7.0.0"
   }

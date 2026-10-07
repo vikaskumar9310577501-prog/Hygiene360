@@ -1,4 +1,4 @@
-const db = require('./database');
+const db = require('./db/sqlite').sync;
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 

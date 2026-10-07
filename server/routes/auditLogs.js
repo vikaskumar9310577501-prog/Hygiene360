@@ -4,7 +4,7 @@ const db = require('../database');
 const { authenticate, requireRole } = require('../middleware/auth');
 
 // Audit logs are visible to Super Admin, Plant Admin, and Management
-router.get('/', authenticate, requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), (req, res) => {
+router.get('/', authenticate, requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), async (req, res) => {
   const { action, role, search, limit = 100, offset = 0 } = req.query;
 
   let query = 'SELECT * FROM audit_logs WHERE 1=1';
@@ -23,11 +23,13 @@ router.get('/', authenticate, requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEM
     params.push(`%${search}%`, `%${search}%`, `%${search}%`);
   }
 
+  const limitNum = Number.isInteger(Number(limit)) && Number(limit) >= 0 ? Number(limit) : 100;
+  const offsetNum = Number.isInteger(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
   query += ' ORDER BY id DESC LIMIT ? OFFSET ?';
-  params.push(Number(limit), Number(offset));
+  params.push(limitNum, offsetNum);
 
-  const logs = db.all(query, params);
-  const countRow = db.get('SELECT COUNT(*) as total FROM audit_logs');
+  const logs = await db.all(query, params);
+  const countRow = await db.get('SELECT COUNT(*) as total FROM audit_logs');
 
   res.json({
     success: true,

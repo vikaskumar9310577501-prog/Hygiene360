@@ -10,7 +10,7 @@ const { sendOtpEmail } = require('../utils/emailService');
 const otpStore = new Map();
 
 // Resolve a user by exact Email, Employee ID, or Phone number — never by partial match
-function findUserByIdentifier(identifier) {
+async function findUserByIdentifier(identifier) {
   const raw = String(identifier || '').trim();
   if (!raw) return null;
 
@@ -18,7 +18,7 @@ function findUserByIdentifier(identifier) {
     return db.get('SELECT * FROM users WHERE LOWER(email) = ?', [raw.toLowerCase()]);
   }
 
-  const byEmpId = db.get('SELECT * FROM users WHERE UPPER(employee_id) = ?', [raw.toUpperCase()]);
+  const byEmpId = await db.get('SELECT * FROM users WHERE UPPER(employee_id) = ?', [raw.toUpperCase()]);
   if (byEmpId) return byEmpId;
 
   const digits = raw.replace(/\D/g, '');
@@ -27,7 +27,8 @@ function findUserByIdentifier(identifier) {
     return db.get(`
       SELECT * FROM users
       WHERE phone IS NOT NULL AND phone != ''
-        AND SUBSTR(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''), -10) = ?
+        AND SUBSTR(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''),
+                   LENGTH(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', '')) - 9) = ?
     `, [last10]);
   }
   return null;
@@ -41,7 +42,7 @@ router.post('/send-otp', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Corporate email address or Employee ID is required' });
   }
 
-  const user = findUserByIdentifier(input);
+  const user = await findUserByIdentifier(input);
 
   // User MUST be created in User Management to log in!
   if (!user) {
@@ -112,7 +113,7 @@ router.post('/verify-otp', async (req, res) => {
   }
 
   const cleanOtp = String(otp).trim();
-  const user = findUserByIdentifier(input);
+  const user = await findUserByIdentifier(input);
   if (!user || !user.is_active) {
     return res.status(403).json({
       success: false,
@@ -138,7 +139,7 @@ router.post('/verify-otp', async (req, res) => {
   const token = generateToken(user);
 
   // Audit log login
-  logAudit({
+  await logAudit({
     userId: user.id,
     userName: user.name,
     role: user.role,
@@ -165,7 +166,7 @@ router.post('/login', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Email and password are required' });
   }
 
-  const user = findUserByIdentifier(input);
+  const user = await findUserByIdentifier(input);
   if (!user) {
     return res.status(403).json({
       success: false,
@@ -184,7 +185,7 @@ router.post('/login', async (req, res) => {
   const token = generateToken(user);
 
   // Audit log
-  logAudit({
+  await logAudit({
     userId: user.id,
     userName: user.name,
     role: user.role,

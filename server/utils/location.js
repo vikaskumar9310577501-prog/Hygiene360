@@ -18,9 +18,9 @@ const TOILET_CONTEXT_SQL = `
   LEFT JOIN users u_sup ON t.supervisor_id = u_sup.id
 `;
 
-function getToiletContext(toiletId) {
+async function getToiletContext(toiletId) {
   if (!toiletId) return null;
-  return db.get(`${TOILET_CONTEXT_SQL} WHERE t.id = ?`, [toiletId]) || null;
+  return (await db.get(`${TOILET_CONTEXT_SQL} WHERE t.id = ?`, [toiletId])) || null;
 }
 
 function locationLine(ctx) {
@@ -54,37 +54,38 @@ function watermarkMeta(ctx, { photoType, reference, user }) {
 }
 
 // Supervisor who verifies issues for a toilet: toilet master supervisor, else any plant supervisor, else a plant admin
-function resolveSupervisorId(ctx) {
+async function resolveSupervisorId(ctx) {
   if (ctx && ctx.supervisor_id) return ctx.supervisor_id;
   const plantId = ctx ? ctx.plant_id : null;
-  const sup = db.get(`
+  const sup = await db.get(`
     SELECT id FROM users WHERE role = 'SUPERVISOR' AND is_active = 1 AND (plant_id = ? OR plant_id IS NULL)
     ORDER BY plant_id IS NULL, id LIMIT 1
   `, [plantId]);
   if (sup) return sup.id;
-  const admin = db.get(`
+  const admin = await db.get(`
     SELECT id FROM users WHERE role IN ('PLANT_ADMIN', 'SUPER_ADMIN', 'IT_ADMIN') AND is_active = 1 AND (plant_id = ? OR plant_id IS NULL)
     ORDER BY plant_id IS NULL, id LIMIT 1
   `, [plantId]);
   return admin ? admin.id : 1;
 }
 
-function issueTargetHours() {
-  const row = db.get("SELECT value FROM system_settings WHERE key = 'issue_target_hours'");
+async function issueTargetHours() {
+  const row = await db.get("SELECT value FROM system_settings WHERE key = 'issue_target_hours'");
   const hours = Number(row && row.value);
   return Number.isFinite(hours) && hours > 0 ? hours : 4;
 }
 
 // UTC 'YYYY-MM-DD HH:MM:SS', same format as CURRENT_TIMESTAMP
-function targetFromNow(hours = issueTargetHours()) {
-  return new Date(Date.now() + hours * 3600000).toISOString().replace('T', ' ').slice(0, 19);
+async function targetFromNow(hours) {
+  const h = hours ?? await issueTargetHours();
+  return new Date(Date.now() + h * 3600000).toISOString().replace('T', ' ').slice(0, 19);
 }
 
-function nextTicketNo(prefix) {
-  const row = db.get('SELECT COALESCE(MAX(id), 0) as maxId FROM issues');
+async function nextTicketNo(prefix) {
+  const row = await db.get('SELECT COALESCE(MAX(id), 0) as maxId FROM issues');
   let n = Number(row.maxId) + 301;
   let ticket = `${prefix}-${String(n).padStart(6, '0')}`;
-  while (db.get('SELECT id FROM issues WHERE ticket_no = ?', [ticket])) {
+  while (await db.get('SELECT id FROM issues WHERE ticket_no = ?', [ticket])) {
     n += 1;
     ticket = `${prefix}-${String(n).padStart(6, '0')}`;
   }

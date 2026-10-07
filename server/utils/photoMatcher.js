@@ -1,6 +1,5 @@
-const path = require('path');
-const fs = require('fs');
 const { Jimp, compareHashes, diff } = require('jimp');
+const storage = require('./storage');
 
 /**
  * Compare live photo buffer against the master reference photo on disk using
@@ -23,25 +22,11 @@ async function compareWithMasterPhoto(liveImageSource, masterRelativePath) {
       };
     }
 
-    // 1. Resolve master photo absolute path safely across Windows & POSIX
-    const cleanRel = masterRelativePath.replace(/^[/\\]+/, '');
-    const candidatePaths = [
-      path.join(__dirname, '..', cleanRel),
-      path.join(process.cwd(), 'server', cleanRel),
-      path.join(process.cwd(), cleanRel),
-      masterRelativePath
-    ];
+    // 1. Load master photo from storage
+    const masterBuffer = await storage.read(masterRelativePath);
 
-    let resolvedMasterPath = null;
-    for (const p of candidatePaths) {
-      if (fs.existsSync(p)) {
-        resolvedMasterPath = p;
-        break;
-      }
-    }
-
-    if (!resolvedMasterPath) {
-      console.warn('Master photo file not found on disk at any candidate path for:', masterRelativePath);
+    if (!masterBuffer) {
+      console.warn('Master photo file not found in storage for:', masterRelativePath);
       return {
         hasMaster: false,
         isMatch: true,
@@ -54,7 +39,7 @@ async function compareWithMasterPhoto(liveImageSource, masterRelativePath) {
 
     // 2. Read both images using Jimp
     const [masterImg, liveImg] = await Promise.all([
-      Jimp.read(resolvedMasterPath),
+      Jimp.read(masterBuffer),
       Jimp.read(liveImageSource)
     ]);
 

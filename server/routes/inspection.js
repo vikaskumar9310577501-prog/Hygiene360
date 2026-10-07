@@ -1,9 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const db = require('../database');
+const storage = require('../utils/storage');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { auditLogFromReq } = require('../middleware/audit');
 const { applyWatermark } = require('../utils/watermark');
@@ -12,9 +11,6 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, fieldSize: 15 * 1024 * 1024 }
 });
-
-const EVIDENCE_DIR = path.join(__dirname, '..', 'uploads', 'evidence');
-
 // Submit Supervisor Inspection
 router.post('/submit', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_ADMIN'), upload.single('photo'), async (req, res) => {
   try {
@@ -24,7 +20,7 @@ router.post('/submit', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'P
       return res.status(400).json({ success: false, error: 'toiletId is required' });
     }
 
-    const toilet = db.get(`
+    const toilet = await db.get(`
       SELECT t.*, p.name as plant_name 
       FROM toilets t 
       JOIN plants p ON t.plant_id = p.id 
@@ -50,18 +46,17 @@ router.post('/submit', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'P
       });
 
       const fileName = `H360_INSPECT_${toilet.code}_${Date.now()}.jpg`;
-      fs.writeFileSync(path.join(EVIDENCE_DIR, fileName), watermarked.buffer);
-      photoPath = `/uploads/evidence/${fileName}`;
+      photoPath = await storage.save(`/uploads/evidence/${fileName}`, watermarked.buffer, 'image/jpeg');
     }
 
-    const inspectRes = db.run(`
+    const inspectRes = await db.run(`
       INSERT INTO supervisor_inspections (toilet_id, supervisor_id, session_id, overall_status, score, remarks, evidence_photo_path)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `, [toiletId, req.user.id, sessionId || null, overallStatus || 'SATISFACTORY', score, remarks, photoPath]);
 
     const inspectId = inspectRes.lastInsertRowid;
 
-    auditLogFromReq(req, 'SUPERVISOR_INSPECTION', 'TOILET', toilet.code, {
+    await auditLogFromReq(req, 'SUPERVISOR_INSPECTION', 'TOILET', toilet.code, {
       inspection_id: inspectId,
       overall_status: overallStatus,
       score
@@ -79,7 +74,7 @@ router.post('/submit', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'P
 });
 
 // Get supervisor inspections today
-router.get('/today', authenticate, (req, res) => {
+router.get('/today', authenticate, async (req, res) => {
   const todayStr = new Date().toISOString().slice(0, 10);
   let query = `
     SELECT si.*, t.code as toilet_code, t.name as toilet_name, p.name as plant_name, u.name as supervisor_name
@@ -98,7 +93,7 @@ router.get('/today', authenticate, (req, res) => {
 
   query += ' ORDER BY si.inspected_at DESC';
 
-  const inspections = db.all(query, params);
+  const inspections = await db.all(query, params);
   res.json({ success: true, inspections });
 });
 

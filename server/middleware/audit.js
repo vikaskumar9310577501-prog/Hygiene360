@@ -1,9 +1,9 @@
 const db = require('../database');
 
-function logAudit({ userId, userName, role, action, entityType, entityId, details, ipAddress }) {
+async function logAudit({ userId, userName, role, action, entityType, entityId, details, ipAddress }) {
   try {
     const detailsStr = typeof details === 'object' ? JSON.stringify(details) : String(details || '');
-    db.run(`
+    await db.run(`
       INSERT INTO audit_logs (user_id, user_name, role, action, entity_type, entity_id, details_json, ip_address)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `, [
@@ -24,8 +24,8 @@ function logAudit({ userId, userName, role, action, entityType, entityId, detail
 // Express helper to log from request context
 function auditLogFromReq(req, action, entityType, entityId, details) {
   const user = req.user || {};
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
-  logAudit({
+  const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '127.0.0.1';
+  return logAudit({
     userId: user.id,
     userName: user.name,
     role: user.role,

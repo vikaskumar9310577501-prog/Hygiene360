@@ -1,16 +1,15 @@
 const express = require('express');
 const router = express.Router();
-const path = require('path');
-const fs = require('fs');
 const multer = require('multer');
 const db = require('../database');
+const storage = require('../utils/storage');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { compareWithMasterPhoto } = require('../utils/photoMatcher');
 const { getToiletRefs } = require('../utils/cleanCheck');
 
-function logAudit(req, action, details) {
+async function logAudit(req, action, details) {
   try {
-    db.run(`
+    await db.run(`
       INSERT INTO audit_logs (user_id, user_name, role, action, entity_type, entity_id, details_json, ip_address, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `, [
@@ -26,12 +25,6 @@ function logAudit(req, action, details) {
   } catch (e) {}
 }
 
-// Storage directory for master reference clean photos
-const MASTER_DIR = path.join(__dirname, '..', 'uploads', 'master_photos');
-if (!fs.existsSync(MASTER_DIR)) {
-  fs.mkdirSync(MASTER_DIR, { recursive: true });
-}
-
 // Multer memory storage for uploads
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -43,7 +36,7 @@ const upload = multer({
  * Lists all checklist items and their corresponding master photos for a plant & optional toilet
  * Accessible to IT_ADMIN, SUPER_ADMIN
  */
-router.get('/', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMIN'), (req, res) => {
+router.get('/', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMIN'), async (req, res) => {
   const { plantId, toiletId } = req.query;
 
   if (!plantId) {
@@ -51,7 +44,7 @@ router.get('/', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMI
   }
 
   // Fetch all checklist items
-  const items = db.all(`
+  const items = await db.all(`
     SELECT id, category, label, description, is_mandatory, order_num
     FROM checklist_items
     WHERE is_active = 1
@@ -61,13 +54,13 @@ router.get('/', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMI
   // Fetch master photos for this plant and toilet
   let masterPhotos;
   if (toiletId && toiletId !== 'all') {
-    masterPhotos = db.all(`
+    masterPhotos = await db.all(`
       SELECT * FROM master_reference_photos
       WHERE plant_id = ? AND (toilet_id = ? OR toilet_id IS NULL)
-      ORDER BY toilet_id DESC
+      ORDER BY toilet_id DESC NULLS LAST
     `, [plantId, toiletId]);
   } else {
-    masterPhotos = db.all(`
+    masterPhotos = await db.all(`
       SELECT * FROM master_reference_photos
       WHERE plant_id = ? AND toilet_id IS NULL
     `, [plantId]);
@@ -107,7 +100,7 @@ router.post('/upload', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), upl
       return res.status(400).json({ success: false, error: 'plantId and itemId are required.' });
     }
 
-    const item = db.get('SELECT id, label, category FROM checklist_items WHERE id = ?', [itemId]);
+    const item = await db.get('SELECT id, label, category FROM checklist_items WHERE id = ?', [itemId]);
     if (!item) {
       return res.status(404).json({ success: false, error: 'Checklist item not found' });
     }
@@ -127,34 +120,31 @@ router.post('/upload', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), upl
 
     const targetToiletId = toiletId && toiletId !== 'all' ? parseInt(toiletId, 10) : null;
     const filename = `master_p${plantId}_t${targetToiletId || 'default'}_i${itemId}_${Date.now()}.${fileExt}`;
-    const filePath = path.join(MASTER_DIR, filename);
-
-    // Save image to disk
-    fs.writeFileSync(filePath, imageBuffer);
     const imageUrl = `/uploads/master_photos/${filename}`;
+    await storage.save(imageUrl, imageBuffer, fileExt === 'png' ? 'image/png' : 'image/jpeg');
 
     // Upsert into master_reference_photos
-    const existing = db.get(`
-      SELECT id, image_url FROM master_reference_photos
-      WHERE plant_id = ? AND (toilet_id = ? OR (toilet_id IS NULL AND ? IS NULL)) AND item_id = ?
-    `, [plantId, targetToiletId, targetToiletId, itemId]);
+    const existing = targetToiletId === null
+      ? await db.get(`
+          SELECT id, image_url FROM master_reference_photos
+          WHERE plant_id = ? AND toilet_id IS NULL AND item_id = ?
+        `, [plantId, itemId])
+      : await db.get(`
+          SELECT id, image_url FROM master_reference_photos
+          WHERE plant_id = ? AND toilet_id = ? AND item_id = ?
+        `, [plantId, targetToiletId, itemId]);
 
     if (existing) {
       // Remove old file if it exists
-      if (existing.image_url) {
-        const oldPath = path.join(__dirname, '..', existing.image_url);
-        if (fs.existsSync(oldPath)) {
-          try { fs.unlinkSync(oldPath); } catch (e) {}
-        }
-      }
+      if (existing.image_url) await storage.remove(existing.image_url);
 
-      db.run(`
+      await db.run(`
         UPDATE master_reference_photos
         SET image_url = ?, uploaded_by_name = ?, uploaded_by_emp_id = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `, [imageUrl, req.user.name, req.user.employee_id || 'IT_ADMIN', existing.id]);
     } else {
-      db.run(`
+      await db.run(`
         INSERT INTO master_reference_photos (
           plant_id, toilet_id, item_id, item_code, item_label, image_url,
           uploaded_by_name, uploaded_by_emp_id, created_at, updated_at
@@ -171,7 +161,7 @@ router.post('/upload', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), upl
       ]);
     }
 
-    logAudit(req, 'MASTER_PHOTO_UPDATED', {
+    await logAudit(req, 'MASTER_PHOTO_UPDATED', {
       plantId,
       toiletId: targetToiletId,
       itemLabel: item.label,
@@ -200,23 +190,17 @@ router.post('/upload', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), upl
  * 3. DELETE /api/master-photos/:id
  * Only IT ADMIN and SUPER ADMIN can delete
  */
-router.delete('/:id', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), (req, res) => {
-  const photo = db.get('SELECT * FROM master_reference_photos WHERE id = ?', [req.params.id]);
+router.delete('/:id', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), async (req, res) => {
+  const photo = await db.get('SELECT * FROM master_reference_photos WHERE id = ?', [req.params.id]);
   if (!photo) {
     return res.status(404).json({ success: false, error: 'Master photo not found' });
   }
 
-  // Delete file from disk
-  if (photo.image_url) {
-    const fullPath = path.join(__dirname, '..', photo.image_url);
-    if (fs.existsSync(fullPath)) {
-      try { fs.unlinkSync(fullPath); } catch (e) {}
-    }
-  }
+  if (photo.image_url) await storage.remove(photo.image_url);
 
-  db.run('DELETE FROM master_reference_photos WHERE id = ?', [req.params.id]);
+  await db.run('DELETE FROM master_reference_photos WHERE id = ?', [req.params.id]);
 
-  logAudit(req, 'MASTER_PHOTO_DELETED', {
+  await logAudit(req, 'MASTER_PHOTO_DELETED', {
     itemLabel: photo.item_label,
     plantId: photo.plant_id
   });
@@ -229,7 +213,7 @@ router.delete('/:id', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), (req
  * Public for authenticated housekeeper when cleaning a toilet
  * Returns the master photo for ghost overlay & live alignment box
  */
-router.get('/for-item', authenticate, (req, res) => {
+router.get('/for-item', authenticate, async (req, res) => {
   const { itemId, toiletId, plantId } = req.query;
 
   if (!itemId) {
@@ -239,7 +223,7 @@ router.get('/for-item', authenticate, (req, res) => {
   // 1. Try toilet-specific master photo
   let master = null;
   if (toiletId) {
-    master = db.get(`
+    master = await db.get(`
       SELECT * FROM master_reference_photos
       WHERE item_id = ? AND toilet_id = ?
     `, [itemId, toiletId]);
@@ -247,7 +231,7 @@ router.get('/for-item', authenticate, (req, res) => {
 
   // 2. If not found, fallback to plant-level default
   if (!master && plantId) {
-    master = db.get(`
+    master = await db.get(`
       SELECT * FROM master_reference_photos
       WHERE item_id = ? AND plant_id = ? AND toilet_id IS NULL
     `, [itemId, plantId]);
@@ -255,7 +239,7 @@ router.get('/for-item', authenticate, (req, res) => {
 
   // 3. Fallback to any master photo for this item in system
   if (!master) {
-    master = db.get(`
+    master = await db.get(`
       SELECT * FROM master_reference_photos
       WHERE item_id = ?
       ORDER BY updated_at DESC LIMIT 1
@@ -284,13 +268,13 @@ router.post('/compare', authenticate, async (req, res) => {
     // Lookup master photo
     let master = null;
     if (toiletId) {
-      master = db.get('SELECT * FROM master_reference_photos WHERE item_id = ? AND toilet_id = ?', [itemId, toiletId]);
+      master = await db.get('SELECT * FROM master_reference_photos WHERE item_id = ? AND toilet_id = ?', [itemId, toiletId]);
     }
     if (!master && plantId) {
-      master = db.get('SELECT * FROM master_reference_photos WHERE item_id = ? AND plant_id = ? AND toilet_id IS NULL', [itemId, plantId]);
+      master = await db.get('SELECT * FROM master_reference_photos WHERE item_id = ? AND plant_id = ? AND toilet_id IS NULL', [itemId, plantId]);
     }
     if (!master) {
-      master = db.get('SELECT * FROM master_reference_photos WHERE item_id = ? ORDER BY updated_at DESC LIMIT 1', [itemId]);
+      master = await db.get('SELECT * FROM master_reference_photos WHERE item_id = ? ORDER BY updated_at DESC LIMIT 1', [itemId]);
     }
 
     // If no master photo has been uploaded by IT Admin yet, we accept with warning
@@ -333,22 +317,22 @@ const MAX_TOILET_REFS = 4;
 const REF_KINDS = ['TOILET', 'CHECK_SHEET'];
 
 // Reference photos per toilet: the live camera guides the housekeeper to the same view and the clean check compares against them
-router.get('/toilet-refs/:toiletId', authenticate, (req, res) => {
+router.get('/toilet-refs/:toiletId', authenticate, async (req, res) => {
   const kind = REF_KINDS.includes(req.query.kind) ? req.query.kind : 'TOILET';
   const toiletId = Number(req.params.toiletId);
-  const refs = getToiletRefs(toiletId, kind, { fallbackToPlant: kind === 'CHECK_SHEET' && req.query.fallback === '1' })
+  const refs = (await getToiletRefs(toiletId, kind, { fallbackToPlant: kind === 'CHECK_SHEET' && req.query.fallback === '1' }))
     .map(r => ({ id: r.id, toilet_id: r.toilet_id, kind: r.kind, image_url: r.image_url, uploaded_by_name: r.uploaded_by_name, created_at: r.created_at }));
   const inherited = refs.some(r => r.toilet_id !== toiletId);
   res.json({ success: true, kind, max: MAX_TOILET_REFS, inherited, refs });
 });
 
-router.post('/toilet-refs/:toiletId', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), upload.single('imageFile'), (req, res) => {
+router.post('/toilet-refs/:toiletId', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), upload.single('imageFile'), async (req, res) => {
   try {
-    const toilet = db.get('SELECT id, plant_id, code FROM toilets WHERE id = ?', [Number(req.params.toiletId)]);
+    const toilet = await db.get('SELECT id, plant_id, code FROM toilets WHERE id = ?', [Number(req.params.toiletId)]);
     if (!toilet) return res.status(404).json({ success: false, error: 'Toilet not found' });
     const kind = REF_KINDS.includes(req.body.kind) ? req.body.kind : 'TOILET';
 
-    const count = db.get('SELECT COUNT(*) AS c FROM toilet_reference_photos WHERE toilet_id = ? AND kind = ?', [toilet.id, kind]).c;
+    const count = Number((await db.get('SELECT COUNT(*) AS c FROM toilet_reference_photos WHERE toilet_id = ? AND kind = ?', [toilet.id, kind])).c);
     if (count >= MAX_TOILET_REFS) {
       return res.status(400).json({ success: false, error: `Maximum ${MAX_TOILET_REFS} reference photos allowed. Delete one first.` });
     }
@@ -363,13 +347,13 @@ router.post('/toilet-refs/:toiletId', authenticate, requireRole('SUPER_ADMIN', '
     }
 
     const filename = `ref_t${toilet.id}_${kind.toLowerCase()}_${Date.now()}.jpg`;
-    fs.writeFileSync(path.join(MASTER_DIR, filename), imageBuffer);
     const imageUrl = `/uploads/master_photos/${filename}`;
-    const r = db.run(
+    await storage.save(imageUrl, imageBuffer, 'image/jpeg');
+    const r = await db.run(
       'INSERT INTO toilet_reference_photos (toilet_id, plant_id, kind, image_url, uploaded_by_name) VALUES (?, ?, ?, ?, ?)',
       [toilet.id, toilet.plant_id, kind, imageUrl, req.user.name]
     );
-    logAudit(req, 'TOILET_REFERENCE_ADDED', { itemLabel: `${toilet.code} ${kind}`, imageUrl });
+    await logAudit(req, 'TOILET_REFERENCE_ADDED', { itemLabel: `${toilet.code} ${kind}`, imageUrl });
     res.json({ success: true, ref: { id: r.lastInsertRowid, toilet_id: toilet.id, kind, image_url: imageUrl } });
   } catch (err) {
     console.error('Toilet reference upload error:', err);
@@ -377,15 +361,12 @@ router.post('/toilet-refs/:toiletId', authenticate, requireRole('SUPER_ADMIN', '
   }
 });
 
-router.delete('/toilet-refs/ref/:id', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), (req, res) => {
-  const ref = db.get('SELECT * FROM toilet_reference_photos WHERE id = ?', [Number(req.params.id)]);
+router.delete('/toilet-refs/ref/:id', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN'), async (req, res) => {
+  const ref = await db.get('SELECT * FROM toilet_reference_photos WHERE id = ?', [Number(req.params.id)]);
   if (!ref) return res.status(404).json({ success: false, error: 'Reference photo not found' });
-  const fullPath = path.join(__dirname, '..', ref.image_url.replace(/^[/\\]+/, ''));
-  if (fs.existsSync(fullPath)) {
-    try { fs.unlinkSync(fullPath); } catch (e) {}
-  }
-  db.run('DELETE FROM toilet_reference_photos WHERE id = ?', [ref.id]);
-  logAudit(req, 'TOILET_REFERENCE_DELETED', { itemLabel: `toilet ${ref.toilet_id} ${ref.kind}` });
+  await storage.remove(ref.image_url);
+  await db.run('DELETE FROM toilet_reference_photos WHERE id = ?', [ref.id]);
+  await logAudit(req, 'TOILET_REFERENCE_DELETED', { itemLabel: `toilet ${ref.toilet_id} ${ref.kind}` });
   res.json({ success: true });
 });
 

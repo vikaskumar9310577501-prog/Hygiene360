@@ -21,18 +21,40 @@ function isGlobalAdmin(user) {
   return user.role === 'SUPER_ADMIN' || user.role === 'IT_ADMIN' || !user.plant_id;
 }
 
-function scopedPlantIds(req, source = req.query) {
+async function scopedPlantIds(req, source = req.query) {
   if (!isGlobalAdmin(req.user)) return [req.user.plant_id];
   const { plantId, location } = source;
-  if (plantId && plantId !== 'all') return [Number(plantId)];
+  if (plantId && plantId !== 'all') {
+    const id = Number(plantId);
+    return Number.isInteger(id) ? [id] : [];
+  }
   const rows = location && location !== 'all'
-    ? db.all('SELECT id FROM plants WHERE location = ?', [location])
-    : db.all('SELECT id FROM plants');
+    ? await db.all('SELECT id FROM plants WHERE location = ?', [location])
+    : await db.all('SELECT id FROM plants');
   return rows.map(r => r.id);
+}
+
+async function slotsByPlant(plantIds) {
+  const map = new Map(plantIds.map(id => [id, []]));
+  if (!plantIds.length) return map;
+  const rows = await db.all(
+    `SELECT * FROM cleaning_slots WHERE plant_id IN (${inList(plantIds)}) AND area_id IS NULL AND is_active = 1 ORDER BY start_time ASC`,
+    plantIds
+  );
+  for (const s of rows) {
+    if (!map.has(s.plant_id)) map.set(s.plant_id, []);
+    map.get(s.plant_id).push(s);
+  }
+  return map;
 }
 
 function canAccessPlant(req, plantId) {
   return isGlobalAdmin(req.user) || Number(plantId) === Number(req.user.plant_id);
+}
+
+function idParam(value) {
+  const n = Number(value);
+  return Number.isInteger(n) ? n : 0;
 }
 
 function inList(ids) {
@@ -43,7 +65,7 @@ function nowSql() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
-function sessionWithPlant(id) {
+async function sessionWithPlant(id) {
   return db.get(`
     SELECT cs.*, t.code as toilet_code, t.name as toilet_name, t.gender as toilet_gender, t.plant_id,
            p.name as plant_name, p.location as plant_location,
@@ -69,16 +91,16 @@ function sessionPriority(s) {
 }
 
 // ----------------- FILTERS -----------------
-router.get('/filters', (req, res) => {
-  const plantIds = scopedPlantIds(req, {});
-  const plants = db.all(`SELECT id, name, code, location FROM plants WHERE id IN (${inList(plantIds)}) ORDER BY location, name`, plantIds);
+router.get('/filters', async (req, res) => {
+  const plantIds = await scopedPlantIds(req, {});
+  const plants = await db.all(`SELECT id, name, code, location FROM plants WHERE id IN (${inList(plantIds)}) ORDER BY location, name`, plantIds);
   const locations = [...new Set(plants.map(p => p.location).filter(Boolean))];
-  const housekeepers = db.all(`
+  const housekeepers = await db.all(`
     SELECT id, name, employee_id, plant_id FROM users
     WHERE is_active = 1 AND role IN ('HOUSEKEEPING_AGENT', 'HOUSEKEEPING') AND plant_id IN (${inList(plantIds)})
     ORDER BY name
   `, plantIds);
-  const toilets = db.all(`
+  const toilets = await db.all(`
     SELECT id, code, name, plant_id FROM toilets WHERE is_active = 1 AND plant_id IN (${inList(plantIds)}) ORDER BY code
   `, plantIds);
   res.json({ success: true, plants, locations, housekeepers, toilets, isGlobal: isGlobalAdmin(req.user) });
@@ -86,9 +108,9 @@ router.get('/filters', (req, res) => {
 
 // ----------------- CLEANING TIME SLOTS (location-wise) -----------------
 // A location's timings are stored as one copy per plant; the same start–end time across plants is one location slot
-function slotScopePlants(req, src) {
-  const ids = scopedPlantIds(req, {});
-  const plants = db.all(`SELECT id, name, code, location FROM plants WHERE id IN (${inList(ids)}) ORDER BY name`, ids);
+async function slotScopePlants(req, src) {
+  const ids = await scopedPlantIds(req, {});
+  const plants = await db.all(`SELECT id, name, code, location FROM plants WHERE id IN (${inList(ids)}) ORDER BY name`, ids);
   if (src.location && src.location !== 'all') {
     const list = plants.filter(p => p.location === src.location);
     return list.length ? { plants: list, label: src.location } : { error: 'No plant found in this location' };
@@ -100,10 +122,11 @@ function slotScopePlants(req, src) {
   return { error: 'Please select a location' };
 }
 
-function locationSlots(plants) {
+async function locationSlots(plants) {
   const byTime = new Map();
+  const plantSlots = await slotsByPlant(plants.map(p => p.id));
   for (const p of plants) {
-    for (const s of slotUtils.getPlantSlots(p.id)) {
+    for (const s of plantSlots.get(p.id) || []) {
       const key = `${s.start_time}-${s.end_time}`;
       if (!byTime.has(key)) {
         byTime.set(key, { key, label: s.label, start_time: s.start_time, end_time: s.end_time, range: slotUtils.slotRange(s), slot_ids: [], plant_ids: [] });
@@ -118,7 +141,7 @@ function locationSlots(plants) {
     .sort((a, b) => a.start_time.localeCompare(b.start_time));
 }
 
-function validateSlotPayload(body, plants, excludeIds = []) {
+async function validateSlotPayload(body, plants, excludeIds = []) {
   const label = String(body.label || '').trim();
   const start = String(body.start_time || '').trim();
   const end = String(body.end_time || '').trim();
@@ -127,8 +150,9 @@ function validateSlotPayload(body, plants, excludeIds = []) {
   if (!label) return 'Please enter a slot name (e.g. "Morning 8 AM")';
   if (st === null || en === null) return 'Please enter Start and End time in the correct format';
   if (en <= st) return 'End time must be after Start time';
+  const plantSlots = await slotsByPlant(plants.map(p => p.id));
   for (const p of plants) {
-    const overlapping = slotUtils.getPlantSlots(p.id).find(s =>
+    const overlapping = (plantSlots.get(p.id) || []).find(s =>
       !excludeIds.includes(s.id) && st < slotUtils.toMinutes(s.end_time) && en > slotUtils.toMinutes(s.start_time)
     );
     if (overlapping) return `This time overlaps with the "${overlapping.label}" (${slotUtils.slotRange(overlapping)}) slot${plants.length > 1 ? ` in ${p.name}` : ''}`;
@@ -136,54 +160,54 @@ function validateSlotPayload(body, plants, excludeIds = []) {
   return null;
 }
 
-function slotIdsInScope(body, plants) {
+async function slotIdsInScope(body, plants) {
   const ids = Array.isArray(body.slot_ids) ? body.slot_ids.map(Number).filter(Boolean) : [];
   if (!ids.length) return [];
   const plantIds = plants.map(p => p.id);
-  return db.all(`SELECT * FROM cleaning_slots WHERE id IN (${inList(ids)}) AND is_active = 1`, ids)
+  return (await db.all(`SELECT * FROM cleaning_slots WHERE id IN (${inList(ids)}) AND is_active = 1`, ids))
     .filter(s => plantIds.includes(s.plant_id));
 }
 
-router.get('/slots', (req, res) => {
-  const scope = slotScopePlants(req, req.query);
+router.get('/slots', async (req, res) => {
+  const scope = await slotScopePlants(req, req.query);
   if (scope.error) return res.status(400).json({ success: false, error: scope.error });
-  res.json({ success: true, plants: scope.plants, slots: locationSlots(scope.plants) });
+  res.json({ success: true, plants: scope.plants, slots: await locationSlots(scope.plants) });
 });
 
-router.post('/slots', (req, res) => {
-  const scope = slotScopePlants(req, req.body);
+router.post('/slots', async (req, res) => {
+  const scope = await slotScopePlants(req, req.body);
   if (scope.error) return res.status(400).json({ success: false, error: scope.error });
-  const err = validateSlotPayload(req.body, scope.plants);
+  const err = await validateSlotPayload(req.body, scope.plants);
   if (err) return res.status(400).json({ success: false, error: err });
 
   const label = req.body.label.trim();
   const start = req.body.start_time.trim();
   const end = req.body.end_time.trim();
   for (const p of scope.plants) {
-    db.run(
+    await db.run(
       'INSERT INTO cleaning_slots (plant_id, area_id, label, start_time, end_time, created_by) VALUES (?, NULL, ?, ?, ?, ?)',
       [p.id, label, start, end, req.user.id]
     );
   }
-  auditLogFromReq(req, 'CLEANING_SLOT_CREATED', 'LOCATION', scope.label, {
+  await auditLogFromReq(req, 'CLEANING_SLOT_CREATED', 'LOCATION', scope.label, {
     plants: scope.plants.map(p => p.name), label, start, end
   });
   res.json({ success: true, plants: scope.plants.length });
 });
 
-router.put('/slots', (req, res) => {
-  const scope = slotScopePlants(req, req.body);
+router.put('/slots', async (req, res) => {
+  const scope = await slotScopePlants(req, req.body);
   if (scope.error) return res.status(400).json({ success: false, error: scope.error });
-  const existing = slotIdsInScope(req.body, scope.plants);
+  const existing = await slotIdsInScope(req.body, scope.plants);
   if (!existing.length) return res.status(404).json({ success: false, error: 'Slot not found' });
-  const err = validateSlotPayload(req.body, scope.plants, existing.map(s => s.id));
+  const err = await validateSlotPayload(req.body, scope.plants, existing.map(s => s.id));
   if (err) return res.status(400).json({ success: false, error: err });
 
   const label = req.body.label.trim();
   const start = req.body.start_time.trim();
   const end = req.body.end_time.trim();
   for (const s of existing) {
-    db.run(
+    await db.run(
       'UPDATE cleaning_slots SET label = ?, start_time = ?, end_time = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
       [label, start, end, s.id]
     );
@@ -191,39 +215,39 @@ router.put('/slots', (req, res) => {
   // Saving also applies the slot to plants of this location that did not have it yet
   const covered = new Set(existing.map(s => s.plant_id));
   for (const p of scope.plants.filter(x => !covered.has(x.id))) {
-    db.run(
+    await db.run(
       'INSERT INTO cleaning_slots (plant_id, area_id, label, start_time, end_time, created_by) VALUES (?, NULL, ?, ?, ?, ?)',
       [p.id, label, start, end, req.user.id]
     );
   }
-  auditLogFromReq(req, 'CLEANING_SLOT_UPDATED', 'LOCATION', scope.label, {
+  await auditLogFromReq(req, 'CLEANING_SLOT_UPDATED', 'LOCATION', scope.label, {
     from: `${existing[0].start_time}-${existing[0].end_time}`, to: `${start}-${end}`, plants: scope.plants.map(p => p.name)
   });
   res.json({ success: true });
 });
 
-router.delete('/slots', (req, res) => {
-  const scope = slotScopePlants(req, req.body);
+router.delete('/slots', async (req, res) => {
+  const scope = await slotScopePlants(req, req.body);
   if (scope.error) return res.status(400).json({ success: false, error: scope.error });
-  const existing = slotIdsInScope(req.body, scope.plants);
+  const existing = await slotIdsInScope(req.body, scope.plants);
   if (!existing.length) return res.status(404).json({ success: false, error: 'Slot not found' });
   for (const s of existing) {
-    db.run('UPDATE cleaning_slots SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [s.id]);
+    await db.run('UPDATE cleaning_slots SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [s.id]);
   }
-  auditLogFromReq(req, 'CLEANING_SLOT_DELETED', 'LOCATION', scope.label, {
+  await auditLogFromReq(req, 'CLEANING_SLOT_DELETED', 'LOCATION', scope.label, {
     label: existing[0].label, range: `${existing[0].start_time}-${existing[0].end_time}`, plants: scope.plants.map(p => p.name)
   });
   res.json({ success: true });
 });
 
 // ----------------- DASHBOARD (KPIs + live slot board) -----------------
-router.get('/dashboard', (req, res) => {
+router.get('/dashboard', async (req, res) => {
   const ist = slotUtils.istNow();
   const date = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || '') ? req.query.date : ist.date;
-  const plantIds = scopedPlantIds(req);
+  const plantIds = await scopedPlantIds(req);
 
-  const plants = db.all(`SELECT id, name, code, location FROM plants WHERE id IN (${inList(plantIds)}) ORDER BY location, name`, plantIds);
-  const toilets = db.all(`
+  const plants = await db.all(`SELECT id, name, code, location FROM plants WHERE id IN (${inList(plantIds)}) ORDER BY location, name`, plantIds);
+  const toilets = await db.all(`
     SELECT t.id, t.code, t.name, t.gender, t.plant_id, t.area_id, t.assigned_user_id,
            u.name as assigned_user_name, u.employee_id as assigned_user_emp_id,
            a.name as area_name
@@ -234,7 +258,7 @@ router.get('/dashboard', (req, res) => {
     ORDER BY t.code
   `, plantIds);
 
-  const sessions = db.all(`
+  const sessions = await db.all(`
     SELECT cs.id, cs.toilet_id, cs.slot_id, cs.status, cs.approval_status, cs.submit_time, cs.start_time,
            cs.approved_at, cs.approved_by_name, cs.reviewed_at, cs.submitted_late, cs.checklist_score,
            u.name as agent_name, u.employee_id as agent_emp_id,
@@ -257,14 +281,16 @@ router.get('/dashboard', (req, res) => {
 
   const lastCleaner = {};
   if (toilets.length) {
-    db.all(`
+    const lastRows = await db.all(`
       SELECT cs.toilet_id, u.name as agent_name, u.employee_id as agent_emp_id, cs.submit_time
       FROM cleaning_sessions cs
       JOIN users u ON cs.user_id = u.id
       WHERE cs.status = 'COMPLETED' AND cs.toilet_id IN (${inList(toilets.map(t => t.id))})
         AND cs.id = (SELECT MAX(x.id) FROM cleaning_sessions x WHERE x.toilet_id = cs.toilet_id AND x.status = 'COMPLETED')
-    `, toilets.map(t => t.id)).forEach(r => { lastCleaner[r.toilet_id] = r; });
+    `, toilets.map(t => t.id));
+    for (const r of lastRows) lastCleaner[r.toilet_id] = r;
   }
+  const plantSlots = await slotsByPlant(plants.map(p => p.id));
 
   // submit_time is stored in UTC; minutes late are measured against the slot end in IST
   const minutesLate = (sess, slot) => {
@@ -283,7 +309,7 @@ router.get('/dashboard', (req, res) => {
     const slotMap = new Map();
     const rows = toilets.filter(t => t.plant_id === p.id).map(t => ({
       ...t,
-      cells: slotUtils.getToiletSlots(t).map(s => {
+      cells: (plantSlots.get(t.plant_id) || []).map(s => {
         if (!slotMap.has(s.id)) slotMap.set(s.id, { ...s, range: slotUtils.slotRange(s) });
         const sess = best[`${t.id}_${s.id}`] || null;
         const status = slotUtils.computeCellStatus(s, sess, date, ist);
@@ -319,20 +345,20 @@ router.get('/dashboard', (req, res) => {
     return { plant: p, slots, rows, currentSlotId: current ? current.id : null };
   });
 
-  const pendingApprovals = db.get(`
+  const pendingApprovals = (await db.get(`
     SELECT COUNT(*) as c FROM cleaning_sessions cs JOIN toilets t ON cs.toilet_id = t.id
     WHERE cs.status = 'COMPLETED' AND cs.approval_status = 'PENDING' AND t.plant_id IN (${inList(plantIds)})
-  `, plantIds).c;
+  `, plantIds)).c;
 
-  const openComplaints = db.get(`
+  const openComplaints = (await db.get(`
     SELECT COUNT(*) as c FROM issues
     WHERE status IN (${inList(OPEN_ISSUE_STATUSES)}) AND plant_id IN (${inList(plantIds)})
-  `, [...OPEN_ISSUE_STATUSES, ...plantIds]).c;
+  `, [...OPEN_ISSUE_STATUSES, ...plantIds])).c;
 
-  const reviewedToday = db.get(`
+  const reviewedToday = (await db.get(`
     SELECT COUNT(*) as c FROM cleaning_sessions cs JOIN toilets t ON cs.toilet_id = t.id
     WHERE cs.approval_status IN ('APPROVED', 'REJECTED') AND cs.slot_date = ? AND t.plant_id IN (${inList(plantIds)})
-  `, [date, ...plantIds]).c;
+  `, [date, ...plantIds])).c;
 
   res.json({
     success: true,
@@ -363,8 +389,8 @@ router.get('/dashboard', (req, res) => {
 });
 
 // ----------------- APPROVALS -----------------
-router.get('/approvals', (req, res) => {
-  const plantIds = scopedPlantIds(req);
+router.get('/approvals', async (req, res) => {
+  const plantIds = await scopedPlantIds(req);
   const status = String(req.query.status || 'PENDING').toUpperCase();
   const params = [...plantIds];
   let where = `t.plant_id IN (${inList(plantIds)}) AND cs.status IN ('COMPLETED', 'REJECTED')`;
@@ -382,7 +408,7 @@ router.get('/approvals', (req, res) => {
     params.push(req.query.date);
   }
 
-  const list = db.all(`
+  const list = await db.all(`
     SELECT cs.id, cs.session_code, cs.toilet_id, cs.status, cs.approval_status, cs.submit_time, cs.start_time,
            cs.slot_label, cs.slot_start, cs.slot_end, cs.slot_date, cs.submitted_late,
            cs.checklist_score, cs.total_items, cs.passed_items, cs.failed_items,
@@ -403,17 +429,17 @@ router.get('/approvals', (req, res) => {
   res.json({ success: true, approvals: list });
 });
 
-router.get('/sessions/:id', (req, res) => {
-  const session = sessionWithPlant(req.params.id);
+router.get('/sessions/:id', async (req, res) => {
+  const session = await sessionWithPlant(req.params.id);
   if (!session) return res.status(404).json({ success: false, error: 'Session not found' });
   if (!canAccessPlant(req, session.plant_id)) return res.status(403).json({ success: false, error: 'You do not have access to this plant' });
 
-  const responses = db.all(`
+  const responses = await db.all(`
     SELECT cr.*, ci.order_num FROM checklist_responses cr
     LEFT JOIN checklist_items ci ON cr.item_id = ci.id
     WHERE cr.session_id = ? ORDER BY ci.order_num ASC
   `, [session.id]);
-  const photos = db.all(`
+  const photos = await db.all(`
     SELECT id, photo_type, storage_path, captured_at, server_received_at, ocr_detected_date, is_live_camera
     FROM evidence_photos WHERE session_id = ? AND is_rejected = 0 ORDER BY id ASC
   `, [session.id]);
@@ -421,13 +447,13 @@ router.get('/sessions/:id', (req, res) => {
   res.json({ success: true, session, responses, photos });
 });
 
-router.post('/sessions/:id/reviewed', (req, res) => {
-  const session = sessionWithPlant(req.params.id);
+router.post('/sessions/:id/reviewed', async (req, res) => {
+  const session = await sessionWithPlant(req.params.id);
   if (!session) return res.status(404).json({ success: false, error: 'Session not found' });
   if (!canAccessPlant(req, session.plant_id)) return res.status(403).json({ success: false, error: 'You do not have access to this plant' });
   if (!session.reviewed_at) {
-    db.run('UPDATE cleaning_sessions SET reviewed_at = ?, reviewed_by = ? WHERE id = ?', [nowSql(), req.user.id, session.id]);
-    auditLogFromReq(req, 'CLEANING_PHOTOS_REVIEWED', 'CLEANING_SESSION', String(session.id), { toilet_code: session.toilet_code });
+    await db.run('UPDATE cleaning_sessions SET reviewed_at = ?, reviewed_by = ? WHERE id = ?', [nowSql(), req.user.id, session.id]);
+    await auditLogFromReq(req, 'CLEANING_PHOTOS_REVIEWED', 'CLEANING_SESSION', String(session.id), { toilet_code: session.toilet_code });
   }
   res.json({ success: true });
 });
@@ -437,22 +463,22 @@ function slotText(session) {
 }
 
 // Approving a re-done cleaning closes the admin's issue on the original entry
-function closeCleaningIssue(req, session, at) {
+async function closeCleaningIssue(req, session, at) {
   if (!session.issue_id) return;
-  const issue = db.get("SELECT id, status FROM issues WHERE id = ? AND complaint_type = 'CLEANING_AUDIT'", [session.issue_id]);
+  const issue = await db.get("SELECT id, status FROM issues WHERE id = ? AND complaint_type = 'CLEANING_AUDIT'", [session.issue_id]);
   if (!issue || issue.status === 'CLOSED') return;
-  db.run("UPDATE issues SET status = 'CLOSED', verified_at = ?, verification_remarks = ? WHERE id = ?",
+  await db.run("UPDATE issues SET status = 'CLOSED', verified_at = ?, verification_remarks = ? WHERE id = ?",
     [at, `Re-done cleaning approved by ${req.user.name}`, issue.id]);
-  db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks) VALUES (?, ?, ?, ?, ?)',
+  await db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks) VALUES (?, ?, ?, ?, ?)',
     [issue.id, req.user.id, issue.status, 'CLOSED', `Re-done cleaning ${session.session_code} approved.`]);
 }
 
 // Admin found a problem in the entry: it counts as fake and comes back to the housekeeper's My Issues to redo
-function raiseCleaningIssue(req, session, remarks, at) {
-  const livePhoto = db.get("SELECT storage_path FROM evidence_photos WHERE session_id = ? AND photo_type = 'CLEANING_EVIDENCE' ORDER BY id DESC LIMIT 1", [session.id]);
-  const targetAt = location.targetFromNow();
+async function raiseCleaningIssue(req, session, remarks, at) {
+  const livePhoto = await db.get("SELECT storage_path FROM evidence_photos WHERE session_id = ? AND photo_type = 'CLEANING_EVIDENCE' ORDER BY id DESC LIMIT 1", [session.id]);
+  const targetAt = await location.targetFromNow();
   const existing = session.issue_id
-    ? db.get("SELECT id, ticket_no, status FROM issues WHERE id = ? AND complaint_type = 'CLEANING_AUDIT'", [session.issue_id])
+    ? await db.get("SELECT id, ticket_no, status FROM issues WHERE id = ? AND complaint_type = 'CLEANING_AUDIT'", [session.issue_id])
     : null;
 
   let issueId;
@@ -460,17 +486,17 @@ function raiseCleaningIssue(req, session, remarks, at) {
   if (existing) {
     issueId = existing.id;
     ticketNo = existing.ticket_no;
-    db.run(`
+    await db.run(`
       UPDATE issues SET status = 'REOPENED', verification_remarks = ?, description = ?, source_session_id = ?, target_at = ?,
              resolved_at = NULL, verified_at = NULL, reopened_count = COALESCE(reopened_count, 0) + 1
       WHERE id = ?
     `, [remarks, remarks, session.id, targetAt, issueId]);
-    db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path) VALUES (?, ?, ?, ?, ?, ?)',
+    await db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path) VALUES (?, ?, ?, ?, ?, ?)',
       [issueId, req.user.id, existing.status, 'REOPENED', `Re-done cleaning ${session.session_code} also not accepted: ${remarks}`, livePhoto ? livePhoto.storage_path : null]);
   } else {
-    const ctx = location.getToiletContext(session.toilet_id);
-    ticketNo = location.nextTicketNo('H360-ISS');
-    const ins = db.run(`
+    const ctx = await location.getToiletContext(session.toilet_id);
+    ticketNo = await location.nextTicketNo('H360-ISS');
+    const ins = await db.run(`
       INSERT INTO issues (ticket_no, plant_id, toilet_id, area_id, category, description, supervisor_id, assigned_agent_id,
                           evidence_photo_path, priority, status, complaint_type, reported_by_name, reported_by_emp_id,
                           checklist_item_label, target_at, source_session_id, is_fake_audit_flagged,
@@ -480,18 +506,18 @@ function raiseCleaningIssue(req, session, remarks, at) {
         livePhoto ? livePhoto.storage_path : null, req.user.name, req.user.employee_id || null, targetAt, session.id,
         session.agent_name || null, session.agent_emp_id || null, session.session_code, remarks]);
     issueId = Number(ins.lastInsertRowid);
-    db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path) VALUES (?, ?, NULL, ?, ?, ?)',
+    await db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path) VALUES (?, ?, NULL, ?, ?, ?)',
       [issueId, req.user.id, 'ASSIGNED', `Issue raised on cleaning ${session.session_code}${slotText(session)}: ${remarks}`, livePhoto ? livePhoto.storage_path : null]);
   }
 
-  db.run(`
+  await db.run(`
     UPDATE cleaning_sessions
     SET status = 'REJECTED', approval_status = 'REJECTED', approved_by = ?, approved_by_name = ?, approved_at = ?,
         approval_remarks = ?, rejection_reason = ?, is_fake_audit_flagged = 1, fake_flag_reason = ?, issue_found = 1, issue_id = ?
     WHERE id = ?
   `, [req.user.id, req.user.name, at, remarks, remarks, `Issue raised by ${req.user.name}: ${remarks}`, issueId, session.id]);
 
-  slotUtils.notify(
+  await slotUtils.notify(
     session.user_id,
     'Cleaning Issue Raised — Please Redo',
     `${ticketNo}: ${req.user.name} raised an issue on your cleaning of ${session.toilet_code} (${session.toilet_name})${slotText(session)}. Remark: ${remarks}. Open My Issues, clean again and resubmit with a live photo.`,
@@ -501,17 +527,17 @@ function raiseCleaningIssue(req, session, remarks, at) {
   return { issueId, ticketNo };
 }
 
-function applyDecision(req, session, decision, remarks) {
+async function applyDecision(req, session, decision, remarks) {
   const at = nowSql();
   let raised = null;
   if (decision === 'APPROVED') {
-    db.run(`
+    await db.run(`
       UPDATE cleaning_sessions
       SET approval_status = 'APPROVED', approved_by = ?, approved_by_name = ?, approved_at = ?, approval_remarks = ?
       WHERE id = ?
     `, [req.user.id, req.user.name, at, remarks || null, session.id]);
-    closeCleaningIssue(req, session, at);
-    slotUtils.notify(
+    await closeCleaningIssue(req, session, at);
+    await slotUtils.notify(
       session.user_id,
       'Cleaning Approved ✓',
       `Cleaning of ${session.toilet_code} (${session.toilet_name})${session.slot_label ? ` • ${session.slot_label}` : ''} was approved by ${req.user.name}.`,
@@ -519,9 +545,9 @@ function applyDecision(req, session, decision, remarks) {
       { session_id: session.id, toilet_code: session.toilet_code, toilet_name: session.toilet_name }
     );
   } else {
-    raised = raiseCleaningIssue(req, session, remarks, at);
+    raised = await raiseCleaningIssue(req, session, remarks, at);
   }
-  auditLogFromReq(req, decision === 'APPROVED' ? 'CLEANING_APPROVED' : 'CLEANING_ISSUE_RAISED', 'CLEANING_SESSION', String(session.id), {
+  await auditLogFromReq(req, decision === 'APPROVED' ? 'CLEANING_APPROVED' : 'CLEANING_ISSUE_RAISED', 'CLEANING_SESSION', String(session.id), {
     toilet_code: session.toilet_code,
     slot: session.slot_label,
     agent: session.agent_name,
@@ -538,60 +564,60 @@ function decisionGuard(req, session) {
   return null;
 }
 
-router.post('/sessions/:id/approve', (req, res) => {
-  const session = sessionWithPlant(req.params.id);
+router.post('/sessions/:id/approve', async (req, res) => {
+  const session = await sessionWithPlant(req.params.id);
   const guard = decisionGuard(req, session);
   if (guard) return res.status(guard[0]).json({ success: false, error: guard[1] });
   if (!session.reviewed_at) {
     return res.status(400).json({ success: false, code: 'NOT_REVIEWED', error: 'Please open and view all photos before approving.' });
   }
-  applyDecision(req, session, 'APPROVED', String(req.body.remarks || '').trim());
+  await applyDecision(req, session, 'APPROVED', String(req.body.remarks || '').trim());
   res.json({ success: true });
 });
 
-function handleRaiseIssue(req, res) {
+async function handleRaiseIssue(req, res) {
   const remarks = String(req.body.remarks || '').trim();
   if (!remarks) return res.status(400).json({ success: false, error: 'Please write a remark describing the issue' });
-  const session = sessionWithPlant(req.params.id);
+  const session = await sessionWithPlant(req.params.id);
   const guard = decisionGuard(req, session);
   if (guard) return res.status(guard[0]).json({ success: false, error: guard[1] });
-  const raised = applyDecision(req, session, 'REJECTED', remarks);
+  const raised = await applyDecision(req, session, 'REJECTED', remarks);
   res.json({ success: true, ...raised });
 }
 
 router.post('/sessions/:id/issue', handleRaiseIssue);
 router.post('/sessions/:id/reject', handleRaiseIssue);
 
-router.post('/approvals/bulk-approve', (req, res) => {
+router.post('/approvals/bulk-approve', async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
   if (!ids.length) return res.status(400).json({ success: false, error: 'No requests selected' });
   const remarks = String(req.body.remarks || '').trim();
   const approved = [];
   const skipped = [];
   for (const id of ids) {
-    const session = sessionWithPlant(id);
+    const session = await sessionWithPlant(id);
     const guard = decisionGuard(req, session);
     if (guard) { skipped.push({ id, reason: guard[1] }); continue; }
     if (!session.reviewed_at) { skipped.push({ id, reason: 'Photos not reviewed yet' }); continue; }
-    applyDecision(req, session, 'APPROVED', remarks);
+    await applyDecision(req, session, 'APPROVED', remarks);
     approved.push(id);
   }
   res.json({ success: true, approved, skipped });
 });
 
 // ----------------- TRACKING / HISTORY -----------------
-router.get('/tracking', (req, res) => {
+router.get('/tracking', async (req, res) => {
   const ist = slotUtils.istNow();
   const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : ist.date;
   const to = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '') ? req.query.to : ist.date;
-  const plantIds = scopedPlantIds(req);
+  const plantIds = await scopedPlantIds(req);
 
   const params = [from, to, ...plantIds];
   let where = `COALESCE(cs.slot_date, cs.date) BETWEEN ? AND ? AND t.plant_id IN (${inList(plantIds)}) AND cs.status IN ('COMPLETED', 'REJECTED')`;
-  if (req.query.userId) { where += ' AND cs.user_id = ?'; params.push(Number(req.query.userId)); }
-  if (req.query.toiletId) { where += ' AND cs.toilet_id = ?'; params.push(Number(req.query.toiletId)); }
+  if (req.query.userId) { where += ' AND cs.user_id = ?'; params.push(idParam(req.query.userId)); }
+  if (req.query.toiletId) { where += ' AND cs.toilet_id = ?'; params.push(idParam(req.query.toiletId)); }
 
-  const sessions = db.all(`
+  const sessions = await db.all(`
     SELECT cs.id, cs.session_code, COALESCE(cs.slot_date, cs.date) as day, cs.slot_label, cs.slot_start, cs.slot_end,
            cs.start_time, cs.submit_time, cs.status, cs.approval_status, cs.approved_at, cs.approved_by_name,
            cs.approval_remarks, cs.reviewed_at, cs.submitted_late, cs.checklist_score,
@@ -608,9 +634,9 @@ router.get('/tracking', (req, res) => {
 
   const missParams = [from, to, ...plantIds];
   let missWhere = `l.kind = 'MISSED' AND l.toilet_id > 0 AND l.slot_date BETWEEN ? AND ? AND t.plant_id IN (${inList(plantIds)})`;
-  if (req.query.userId) { missWhere += ' AND t.assigned_user_id = ?'; missParams.push(Number(req.query.userId)); }
-  if (req.query.toiletId) { missWhere += ' AND l.toilet_id = ?'; missParams.push(Number(req.query.toiletId)); }
-  const missed = db.all(`
+  if (req.query.userId) { missWhere += ' AND t.assigned_user_id = ?'; missParams.push(idParam(req.query.userId)); }
+  if (req.query.toiletId) { missWhere += ' AND l.toilet_id = ?'; missParams.push(idParam(req.query.toiletId)); }
+  const missed = await db.all(`
     SELECT l.id, l.slot_date as day, l.created_at, s.label as slot_label, s.start_time as slot_start, s.end_time as slot_end,
            t.code as toilet_code, t.name as toilet_name, p.name as plant_name, p.location as plant_location,
            u.name as agent_name, u.employee_id as agent_emp_id
@@ -628,13 +654,13 @@ router.get('/tracking', (req, res) => {
 });
 
 // ----------------- HOUSEKEEPER PERFORMANCE -----------------
-router.get('/performance', (req, res) => {
+router.get('/performance', async (req, res) => {
   const ist = slotUtils.istNow();
   const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : ist.date;
   const to = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '') ? req.query.to : ist.date;
-  const plantIds = scopedPlantIds(req);
+  const plantIds = await scopedPlantIds(req);
 
-  const staff = db.all(`
+  const staff = await db.all(`
     SELECT u.id, u.name, u.employee_id, p.name as plant_name,
            (SELECT COUNT(*) FROM toilets t WHERE t.assigned_user_id = u.id AND t.is_active = 1) as toilets_assigned
     FROM users u LEFT JOIN plants p ON u.plant_id = p.id
@@ -642,9 +668,13 @@ router.get('/performance', (req, res) => {
     ORDER BY u.name
   `, plantIds);
 
-  const rows = staff.map(s => {
-    const agg = db.get(`
+  const staffIds = staff.map(s => s.id);
+  const aggByUser = new Map();
+  const missedByUser = new Map();
+  if (staffIds.length) {
+    const aggRows = await db.all(`
       SELECT
+        user_id,
         SUM(CASE WHEN status IN ('COMPLETED', 'REJECTED') THEN 1 ELSE 0 END) as submitted,
         SUM(CASE WHEN approval_status = 'APPROVED' THEN 1 ELSE 0 END) as approved,
         SUM(CASE WHEN approval_status = 'REJECTED' THEN 1 ELSE 0 END) as rejected,
@@ -652,12 +682,21 @@ router.get('/performance', (req, res) => {
         SUM(CASE WHEN submitted_late = 1 AND status = 'COMPLETED' THEN 1 ELSE 0 END) as late,
         AVG(CASE WHEN status = 'COMPLETED' THEN checklist_score END) as avg_score
       FROM cleaning_sessions
-      WHERE user_id = ? AND COALESCE(slot_date, date) BETWEEN ? AND ?
-    `, [s.id, from, to]);
-    const missed = db.get(`
-      SELECT COUNT(*) as c FROM slot_notification_log l JOIN toilets t ON l.toilet_id = t.id
-      WHERE l.kind = 'MISSED' AND t.assigned_user_id = ? AND l.slot_date BETWEEN ? AND ?
-    `, [s.id, from, to]).c;
+      WHERE user_id IN (${inList(staffIds)}) AND COALESCE(slot_date, date) BETWEEN ? AND ?
+      GROUP BY user_id
+    `, [...staffIds, from, to]);
+    for (const r of aggRows) aggByUser.set(r.user_id, r);
+    const missedRows = await db.all(`
+      SELECT t.assigned_user_id as user_id, COUNT(*) as c FROM slot_notification_log l JOIN toilets t ON l.toilet_id = t.id
+      WHERE l.kind = 'MISSED' AND t.assigned_user_id IN (${inList(staffIds)}) AND l.slot_date BETWEEN ? AND ?
+      GROUP BY t.assigned_user_id
+    `, [...staffIds, from, to]);
+    for (const r of missedRows) missedByUser.set(r.user_id, Number(r.c) || 0);
+  }
+
+  const rows = staff.map(s => {
+    const agg = aggByUser.get(s.id) || {};
+    const missed = missedByUser.get(s.id) || 0;
     const submitted = agg.submitted || 0;
     const late = agg.late || 0;
     const onTimeBase = submitted + missed;

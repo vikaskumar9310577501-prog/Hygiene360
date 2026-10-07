@@ -1,7 +1,6 @@
-const path = require('path');
-const fs = require('fs');
 const { Jimp } = require('jimp');
 const db = require('../database');
+const storage = require('./storage');
 
 // Comparison runs on a small square grid so lighting noise and phone resolution don't matter
 const N = 96;
@@ -10,20 +9,14 @@ const BLOCKS = 8;
 // Height of the date/time banner the capture screen stamps at the bottom of every live photo
 const STAMP_BAND_PX = 76;
 
-function setting(key, fallback) {
+async function setting(key, fallback) {
   try {
-    const row = db.get('SELECT value FROM system_settings WHERE key = ?', [key]);
+    const row = await db.get('SELECT value FROM system_settings WHERE key = ?', [key]);
     const v = row ? Number(row.value) : NaN;
     return Number.isFinite(v) ? v : fallback;
   } catch (e) {
     return fallback;
   }
-}
-
-function resolveUpload(rel) {
-  if (!rel) return null;
-  const p = path.join(__dirname, '..', rel.replace(/^[/\\]+/, ''));
-  return fs.existsSync(p) ? p : null;
 }
 
 async function toGray(source, dropStamp) {
@@ -72,14 +65,14 @@ async function features(source, dropStamp) {
   return { gray: normalize(gray), edge: normalize(gradient(gray)) };
 }
 
-// Reference photos rarely change; decoding them on every upload made verification slow
+// Reference photo URLs are timestamped and never overwritten, so features can be cached per URL
 const refCache = new Map();
-async function refFeatures(file) {
-  const mtime = fs.statSync(file).mtimeMs;
-  const hit = refCache.get(file);
-  if (hit && hit.mtime === mtime) return hit.features;
-  const f = await features(file, false);
-  refCache.set(file, { mtime, features: f });
+async function refFeatures(rel) {
+  if (refCache.has(rel)) return refCache.get(rel);
+  const buf = await storage.read(rel);
+  if (!buf) return null;
+  const f = await features(buf, false);
+  refCache.set(rel, f);
   return f;
 }
 
@@ -256,27 +249,27 @@ async function sheetFeatures(source, isLive) {
 }
 
 const sheetRefCache = new Map();
-async function sheetRefVariants(file) {
-  const mtime = fs.statSync(file).mtimeMs;
-  const hit = sheetRefCache.get(file);
-  if (hit && hit.mtime === mtime) return hit.variants;
-  const base = await sheetFeatures(file, false);
+async function sheetRefVariants(rel) {
+  if (sheetRefCache.has(rel)) return sheetRefCache.get(rel);
+  const buf = await storage.read(rel);
+  if (!buf) return null;
+  const base = await sheetFeatures(buf, false);
   const r90 = rotate90(base, SG);
   const r180 = rotate90(r90, SG);
   const variants = [base, r90, r180, rotate90(r180, SG)];
-  sheetRefCache.set(file, { mtime, variants });
+  sheetRefCache.set(rel, variants);
   return variants;
 }
 
 // The check sheet only has to be the real sheet: ticks and handwriting are expected differences
 async function checkSheetAgainstRefs(liveBuffer, refPaths) {
-  const minScene = setting('sheet_check_min_match', 22);
+  const minScene = await setting('sheet_check_min_match', 22);
   const live = await sheetFeatures(liveBuffer, true);
   let bestScore = null;
   for (const rel of refPaths) {
-    const file = resolveUpload(rel);
-    if (!file) continue;
-    for (const v of await sheetRefVariants(file)) {
+    const variants = rel ? await sheetRefVariants(rel) : null;
+    if (!variants) continue;
+    for (const v of variants) {
       const score = Math.max(0, Math.min(100, Math.round(sheetShift(v, live) * 100)));
       if (bestScore === null || score > bestScore) bestScore = score;
     }
@@ -292,15 +285,14 @@ async function checkSheetAgainstRefs(liveBuffer, refPaths) {
 }
 
 async function checkAgainstRefs(liveBuffer, refPaths) {
-  const minScene = setting('clean_check_min_scene', 45);
-  const minClean = setting('clean_check_min_score', 60);
+  const minScene = await setting('clean_check_min_scene', 45);
+  const minClean = await setting('clean_check_min_score', 60);
   const live = await features(liveBuffer, true);
 
   let best = null;
   for (const rel of refPaths) {
-    const file = resolveUpload(rel);
-    if (!file) continue;
-    const ref = await refFeatures(file);
+    const ref = rel ? await refFeatures(rel) : null;
+    if (!ref) continue;
     const shift = bestShift(ref.edge, live.edge);
     const sceneScore = Math.max(0, Math.min(100, Math.round(shift.score * 100)));
     const frac = dirtyFraction(ref, live, shift.dx, shift.dy);
@@ -330,10 +322,10 @@ async function checkAgainstRefs(liveBuffer, refPaths) {
 const MAX_REFS = 4;
 
 // Check sheets are usually the same printed form plant-wide, so a toilet without its own sheet photos uses the plant's
-function getToiletRefs(toiletId, kind = 'TOILET', { fallbackToPlant = kind === 'CHECK_SHEET' } = {}) {
-  const own = db.all('SELECT * FROM toilet_reference_photos WHERE toilet_id = ? AND kind = ? ORDER BY id ASC', [toiletId, kind]);
+async function getToiletRefs(toiletId, kind = 'TOILET', { fallbackToPlant = kind === 'CHECK_SHEET' } = {}) {
+  const own = await db.all('SELECT * FROM toilet_reference_photos WHERE toilet_id = ? AND kind = ? ORDER BY id ASC', [toiletId, kind]);
   if (own.length || !fallbackToPlant) return own;
-  const toilet = db.get('SELECT plant_id FROM toilets WHERE id = ?', [toiletId]);
+  const toilet = await db.get('SELECT plant_id FROM toilets WHERE id = ?', [toiletId]);
   if (!toilet) return own;
   return db.all(
     'SELECT * FROM toilet_reference_photos WHERE plant_id = ? AND kind = ? ORDER BY id DESC LIMIT ?',

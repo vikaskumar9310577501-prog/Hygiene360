@@ -32,7 +32,7 @@ function cleanScannedToken(raw) {
   return cleaned.trim();
 }
 
-function findToiletByScan(cleanedToken, extraWhere = '') {
+async function findToiletByScan(cleanedToken, extraWhere = '') {
   return db.get(`
     ${location.TOILET_CONTEXT_SQL}
     WHERE (t.qr_token = ? OR UPPER(t.toilet_uid) = UPPER(?)) AND t.is_active = 1 ${extraWhere}
@@ -40,14 +40,14 @@ function findToiletByScan(cleanedToken, extraWhere = '') {
 }
 
 // Validate scanned QR token with role-based routing
-router.post('/validate', authenticate, (req, res) => {
+router.post('/validate', authenticate, async (req, res) => {
   const { token } = req.body;
   if (!token) {
     return res.status(400).json({ success: false, error: 'QR token is required' });
   }
 
   const cleanedToken = cleanScannedToken(token);
-  const toilet = findToiletByScan(cleanedToken);
+  const toilet = await findToiletByScan(cleanedToken);
 
   if (!toilet) {
     return res.status(404).json({
@@ -60,7 +60,7 @@ router.post('/validate', authenticate, (req, res) => {
   // IT_ADMIN & SUPER_ADMIN have universal access across all plants
   const isITAdmin = req.user.role === 'SUPER_ADMIN' || req.user.role === 'IT_ADMIN';
   if (!isITAdmin && req.user.plant_id && req.user.plant_id !== toilet.plant_id) {
-    const userPlant = db.get('SELECT name FROM plants WHERE id = ?', [req.user.plant_id]);
+    const userPlant = await db.get('SELECT name FROM plants WHERE id = ?', [req.user.plant_id]);
     return res.status(403).json({
       success: false,
       error: `Access Denied: You are assigned to ${userPlant?.name || 'Plant #' + req.user.plant_id}. You cannot scan or access facilities in ${toilet.plant_name}.`
@@ -68,7 +68,7 @@ router.post('/validate', authenticate, (req, res) => {
   }
 
   // Audit log scan event
-  auditLogFromReq(req, 'QR_SCAN', 'TOILET', toilet.code, {
+  await auditLogFromReq(req, 'QR_SCAN', 'TOILET', toilet.code, {
     token_prefix: cleanedToken.slice(0, 10),
     plant: toilet.plant_name,
     user_role: req.user.role
@@ -77,7 +77,7 @@ router.post('/validate', authenticate, (req, res) => {
   const todayStr = new Date().toISOString().slice(0, 10);
 
   // Fetch today's cleaning session for this toilet if any
-  const todaySession = db.get(`
+  const todaySession = await db.get(`
     SELECT cs.*, u.name as agent_name, u.employee_id as agent_emp_id
     FROM cleaning_sessions cs
     JOIN users u ON cs.user_id = u.id
@@ -86,7 +86,7 @@ router.post('/validate', authenticate, (req, res) => {
   `, [toilet.id, todayStr]);
 
   // Fetch active issues for this toilet
-  const activeIssues = db.all(`
+  const activeIssues = await db.all(`
     SELECT id, ticket_no, category, description, priority, status, created_at
     FROM issues
     WHERE toilet_id = ? AND status NOT IN ('CLOSED', 'VERIFIED')
@@ -95,7 +95,7 @@ router.post('/validate', authenticate, (req, res) => {
 
   // Scanning inside the app always opens the housekeeping cleaning form; scanning with any other
   // scanner opens the public complaint link encoded in the QR instead
-  const areaToilets = db.all(`
+  const areaToilets = await db.all(`
     ${location.TOILET_CONTEXT_SQL}
     WHERE t.is_active = 1 AND t.plant_id = ?
     ORDER BY a.name, t.code
@@ -112,8 +112,8 @@ router.post('/validate', authenticate, (req, res) => {
   });
 });
 // Public facility lookup by QR token (unauthenticated for factory staff scanning with mobile browser camera)
-router.get('/facility/:token', (req, res) => {
-  const found = findToiletByScan(cleanScannedToken(req.params.token));
+router.get('/facility/:token', async (req, res) => {
+  const found = await findToiletByScan(cleanScannedToken(req.params.token));
   if (!found) {
     return res.status(404).json({ success: false, error: 'Facility QR code not found or inactive.' });
   }
@@ -130,23 +130,23 @@ router.get('/facility/:token', (req, res) => {
 });
 
 // Regenerate QR token for a toilet
-router.post('/regenerate/:toiletId', authenticate, requireRole('SUPER_ADMIN', 'PLANT_ADMIN'), (req, res) => {
+router.post('/regenerate/:toiletId', authenticate, requireRole('SUPER_ADMIN', 'PLANT_ADMIN'), async (req, res) => {
   const toiletId = req.params.toiletId;
-  const toilet = db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
+  const toilet = await db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
   if (!toilet) {
     return res.status(404).json({ success: false, error: 'Toilet not found' });
   }
 
   // Deactivate old QR
-  db.run('UPDATE qr_codes SET is_active = 0, disabled_at = CURRENT_TIMESTAMP WHERE toilet_id = ?', [toiletId]);
+  await db.run('UPDATE qr_codes SET is_active = 0, disabled_at = CURRENT_TIMESTAMP WHERE toilet_id = ?', [toiletId]);
 
   // Generate fresh secure token
   const newToken = 'H360-QR-' + crypto.randomBytes(8).toString('hex').toUpperCase();
 
-  db.run('UPDATE toilets SET qr_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newToken, toiletId]);
-  db.run('INSERT INTO qr_codes (toilet_id, token, is_active, regenerated_at) VALUES (?, ?, 1, CURRENT_TIMESTAMP)', [toiletId, newToken]);
+  await db.run('UPDATE toilets SET qr_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newToken, toiletId]);
+  await db.run('INSERT INTO qr_codes (toilet_id, token, is_active, regenerated_at) VALUES (?, ?, 1, CURRENT_TIMESTAMP)', [toiletId, newToken]);
 
-  auditLogFromReq(req, 'QR_REGENERATED', 'TOILET', toilet.code, {
+  await auditLogFromReq(req, 'QR_REGENERATED', 'TOILET', toilet.code, {
     old_token_prefix: toilet.qr_token.slice(0, 10),
     new_token_prefix: newToken.slice(0, 10)
   });
@@ -161,7 +161,7 @@ router.post('/regenerate/:toiletId', authenticate, requireRole('SUPER_ADMIN', 'P
 // Download/Generate QR Code image
 router.get('/image/:toiletId', async (req, res) => {
   const toiletId = req.params.toiletId;
-  const toilet = location.getToiletContext(toiletId);
+  const toilet = await location.getToiletContext(toiletId);
 
   if (!toilet) {
     return res.status(404).send('Toilet not found');
@@ -201,7 +201,7 @@ router.get('/image/:toiletId', async (req, res) => {
 });
 
 // List all QR codes and status
-router.get('/list', authenticate, (req, res) => {
+router.get('/list', authenticate, async (req, res) => {
   let query = `
     SELECT t.id, t.code, t.name, t.gender, t.qr_token, t.toilet_uid, t.is_active, t.area_id, p.name as plant_name, p.id as plant_id,
            b.name as building_name, bl.name as block_name, f.name as floor_name, a.name as area_name,
@@ -222,7 +222,7 @@ router.get('/list', authenticate, (req, res) => {
   }
   query += ' ORDER BY p.name, t.code';
 
-  const list = db.all(query, params);
+  const list = await db.all(query, params);
   res.json({ success: true, qrCodes: list });
 });
 

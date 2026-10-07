@@ -1,4 +1,4 @@
-const db = require('../database');
+const db = require('../db/sqlite').sync;
 const fs = require('fs');
 const path = require('path');
 

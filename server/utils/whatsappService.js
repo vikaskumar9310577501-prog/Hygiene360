@@ -25,14 +25,14 @@ function providerName() {
   return null;
 }
 
-function isAlertEnabled(kind) {
+async function isAlertEnabled(kind) {
   const key = ALERT_SETTING[kind];
   if (!key) return true;
-  const row = db.get('SELECT value FROM system_settings WHERE key = ?', [key]);
+  const row = await db.get('SELECT value FROM system_settings WHERE key = ?', [key]);
   return !row || row.value !== '0';
 }
 
-function getAlertRecipients(plantId) {
+async function getAlertRecipients(plantId) {
   return db.all(`
     SELECT id, name, phone, role FROM users
     WHERE is_active = 1 AND phone IS NOT NULL AND TRIM(phone) != '' AND (
@@ -78,9 +78,9 @@ async function sendTwilio(to, message) {
   if (!res.ok) throw new Error(`Twilio ${res.status}: ${(await res.text()).slice(0, 300)}`);
 }
 
-function log(userId, phone, kind, message, status, error = null) {
+async function log(userId, phone, kind, message, status, error = null) {
   try {
-    db.run('INSERT INTO whatsapp_log (user_id, phone, kind, message, status, error) VALUES (?, ?, ?, ?, ?, ?)',
+    await db.run('INSERT INTO whatsapp_log (user_id, phone, kind, message, status, error) VALUES (?, ?, ?, ?, ?, ?)',
       [userId, phone, kind, message, status, error]);
   } catch (e) {}
 }
@@ -93,22 +93,22 @@ async function sendToUser(user, kind, message) {
   try {
     if (provider === 'meta') await sendMeta(phone, message);
     else await sendTwilio(phone, message);
-    log(user.id, phone, kind, message, 'SENT');
+    await log(user.id, phone, kind, message, 'SENT');
   } catch (err) {
-    log(user.id, phone, kind, message, 'FAILED', err.message);
+    await log(user.id, phone, kind, message, 'FAILED', err.message);
   }
 }
 
-/** Fire-and-forget: never throws, never blocks the request that triggered it. */
-function sendAlert(plantId, kind, message) {
+/** Never throws; await it so serverless runtimes don't drop the send after the response. */
+async function sendAlert(plantId, kind, message) {
   try {
-    if (!isAlertEnabled(kind)) return;
-    const recipients = getAlertRecipients(plantId);
+    if (!(await isAlertEnabled(kind))) return;
+    const recipients = await getAlertRecipients(plantId);
     if (recipients.length === 0) {
-      log(null, null, kind, message, 'SKIPPED', 'No Admin / Plant Head with a phone number');
+      await log(null, null, kind, message, 'SKIPPED', 'No Admin / Plant Head with a phone number');
       return;
     }
-    recipients.forEach(u => { sendToUser(u, kind, message).catch(() => {}); });
+    await Promise.all(recipients.map(u => sendToUser(u, kind, message).catch(() => {})));
   } catch (e) {
     console.error('[WHATSAPP] alert failed:', e.message);
   }

@@ -7,7 +7,7 @@ const { authenticate, requireRole } = require('../middleware/auth');
 const { auditLogFromReq } = require('../middleware/audit');
 
 // ----------------- PLANTS (READ ACCESSIBLE TO ALL AUTHENTICATED ROLES) -----------------
-router.get('/plants', authenticate, (req, res) => {
+router.get('/plants', authenticate, async (req, res) => {
   let query = `
     SELECT p.*,
       (SELECT COUNT(*) FROM toilets t WHERE t.plant_id = p.id) as toilet_count,
@@ -20,14 +20,14 @@ router.get('/plants', authenticate, (req, res) => {
     params.push(req.user.plant_id);
   }
   query += ' ORDER BY p.name ASC';
-  const plants = db.all(query, params);
+  const plants = await db.all(query, params);
   res.json({ success: true, plants });
 });
 
 // Middleware for Admin-only access to configuration and management routes
 router.use(authenticate, requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'));
 
-router.post('/plants', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), (req, res) => {
+router.post('/plants', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), async (req, res) => {
   const { code, name, location } = req.body;
   if (!code || !name) {
     return res.status(400).json({ success: false, error: 'Plant Code and Plant Name are required' });
@@ -38,10 +38,10 @@ router.post('/plants', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), 
   const cleanLoc = (location || '').trim();
 
   // If plant with this code already exists, update name and location gracefully!
-  const existing = db.get('SELECT * FROM plants WHERE UPPER(code) = ?', [cleanCode]);
+  const existing = await db.get('SELECT * FROM plants WHERE UPPER(code) = ?', [cleanCode]);
   if (existing) {
-    db.run('UPDATE plants SET name = ?, location = ? WHERE id = ?', [cleanName, cleanLoc, existing.id]);
-    auditLogFromReq(req, 'PLANT_UPDATED', 'PLANT', cleanCode, { plant_id: existing.id, name: cleanName, location: cleanLoc });
+    await db.run('UPDATE plants SET name = ?, location = ? WHERE id = ?', [cleanName, cleanLoc, existing.id]);
+    await auditLogFromReq(req, 'PLANT_UPDATED', 'PLANT', cleanCode, { plant_id: existing.id, name: cleanName, location: cleanLoc });
     return res.json({
       success: true,
       plantId: existing.id,
@@ -50,81 +50,81 @@ router.post('/plants', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), 
   }
 
   try {
-    const r = db.run(
+    const r = await db.run(
       'INSERT INTO plants (code, name, location) VALUES (?, ?, ?)',
       [cleanCode, cleanName, cleanLoc]
     );
     const newPlantId = r.lastInsertRowid;
 
     // Automatically create initial building, floor, and area hierarchy so QR codes can be created immediately
-    const bldRes = db.run(
+    const bldRes = await db.run(
       'INSERT INTO buildings (plant_id, code, name) VALUES (?, ?, ?)',
       [newPlantId, 'BLD-MAIN', 'Main Plant Building']
     );
-    const flRes = db.run(
+    const flRes = await db.run(
       'INSERT INTO floors (building_id, code, name, floor_number) VALUES (?, ?, ?, ?)',
       [bldRes.lastInsertRowid, 'FL-00', 'Ground Floor', 0]
     );
-    db.run(
+    await db.run(
       'INSERT INTO areas (floor_id, code, name) VALUES (?, ?, ?)',
       [flRes.lastInsertRowid, 'AREA-01', 'General Plant Area']
     );
 
-    auditLogFromReq(req, 'PLANT_CREATED', 'PLANT', cleanCode, { plant_id: newPlantId, name: cleanName, location: cleanLoc });
+    await auditLogFromReq(req, 'PLANT_CREATED', 'PLANT', cleanCode, { plant_id: newPlantId, name: cleanName, location: cleanLoc });
     res.json({ success: true, plantId: newPlantId, message: 'Plant created successfully with initial location structure' });
   } catch (err) {
     res.status(400).json({ success: false, error: 'Failed to create plant: ' + err.message });
   }
 });
 
-router.put('/plants/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), (req, res) => {
+router.put('/plants/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), async (req, res) => {
   const { id } = req.params;
   const { code, name, location } = req.body;
   if (!code || !name) {
     return res.status(400).json({ success: false, error: 'Plant Code and Plant Name are required' });
   }
 
-  const existing = db.get('SELECT * FROM plants WHERE id = ?', [id]);
+  const existing = await db.get('SELECT * FROM plants WHERE id = ?', [id]);
   if (!existing) {
     return res.status(404).json({ success: false, error: 'Plant not found' });
   }
 
   try {
-    db.run(
+    await db.run(
       'UPDATE plants SET code = ?, name = ?, location = ? WHERE id = ?',
       [code.toUpperCase().trim(), name.trim(), (location || '').trim(), id]
     );
-    auditLogFromReq(req, 'PLANT_UPDATED', 'PLANT', code, { plant_id: id, name, location });
+    await auditLogFromReq(req, 'PLANT_UPDATED', 'PLANT', code, { plant_id: id, name, location });
     res.json({ success: true, message: 'Plant location updated successfully' });
   } catch (err) {
     res.status(400).json({ success: false, error: 'Failed to update plant: ' + err.message });
   }
 });
 
-router.delete('/plants/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), (req, res) => {
+router.delete('/plants/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), async (req, res) => {
   const { id } = req.params;
-  const plant = db.get('SELECT * FROM plants WHERE id = ?', [id]);
+  const plant = await db.get('SELECT * FROM plants WHERE id = ?', [id]);
   if (!plant) {
     return res.status(404).json({ success: false, error: 'Plant not found' });
   }
 
   try {
-    db.run('DELETE FROM qr_codes WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
-    db.run('DELETE FROM evidence_photos WHERE session_id IN (SELECT cs.id FROM cleaning_sessions cs JOIN toilets t ON cs.toilet_id = t.id WHERE t.plant_id = ?)', [id]);
-    db.run('DELETE FROM checklist_responses WHERE session_id IN (SELECT cs.id FROM cleaning_sessions cs JOIN toilets t ON cs.toilet_id = t.id WHERE t.plant_id = ?)', [id]);
-    db.run('DELETE FROM cleaning_sessions WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
-    db.run('DELETE FROM supervisor_inspections WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
-    db.run('DELETE FROM issues WHERE plant_id = ?', [id]);
-    db.run('DELETE FROM drinking_water_checks WHERE plant_id = ?', [id]);
-    db.run('DELETE FROM assignments WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
-    db.run('DELETE FROM toilets WHERE plant_id = ?', [id]);
-    db.run('DELETE FROM areas WHERE floor_id IN (SELECT f.id FROM floors f JOIN buildings b ON f.building_id = b.id WHERE b.plant_id = ?)', [id]);
-    db.run('DELETE FROM floors WHERE building_id IN (SELECT b.id FROM buildings b WHERE b.plant_id = ?)', [id]);
-    db.run('DELETE FROM buildings WHERE plant_id = ?', [id]);
-    db.run('DELETE FROM shifts WHERE plant_id = ?', [id]);
-    db.run('DELETE FROM plants WHERE id = ?', [id]);
+    await db.run('DELETE FROM qr_codes WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
+    await db.run('DELETE FROM evidence_photos WHERE session_id IN (SELECT cs.id FROM cleaning_sessions cs JOIN toilets t ON cs.toilet_id = t.id WHERE t.plant_id = ?)', [id]);
+    await db.run('DELETE FROM checklist_responses WHERE session_id IN (SELECT cs.id FROM cleaning_sessions cs JOIN toilets t ON cs.toilet_id = t.id WHERE t.plant_id = ?)', [id]);
+    await db.run('DELETE FROM cleaning_sessions WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
+    await db.run('DELETE FROM supervisor_inspections WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
+    await db.run('DELETE FROM issues WHERE plant_id = ?', [id]);
+    await db.run('DELETE FROM drinking_water_checks WHERE plant_id = ?', [id]);
+    await db.run('DELETE FROM assignments WHERE toilet_id IN (SELECT id FROM toilets WHERE plant_id = ?)', [id]);
+    await db.run('DELETE FROM toilets WHERE plant_id = ?', [id]);
+    await db.run('DELETE FROM areas WHERE floor_id IN (SELECT f.id FROM floors f JOIN buildings b ON f.building_id = b.id WHERE b.plant_id = ?)', [id]);
+    await db.run('DELETE FROM floors WHERE building_id IN (SELECT b.id FROM buildings b WHERE b.plant_id = ?)', [id]);
+    await db.run('DELETE FROM buildings WHERE plant_id = ?', [id]);
+    await db.run('DELETE FROM shifts WHERE plant_id = ?', [id]);
+    await db.run('DELETE FROM plants WHERE id = ?', [id]);
 
-    auditLogFromReq(req, 'PLANT_DELETED', 'PLANT', plant.code, { plant_id: id, name: plant.name });
+    await auditLogFromReq(req, 'PLANT_DELETED', 'PLANT', plant.code, { plant_id: id, name: plant.name });
     res.json({ success: true, message: `Plant ${plant.name} (${plant.code}) and its facilities were successfully deleted.` });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to delete plant: ' + err.message });
@@ -132,24 +132,24 @@ router.delete('/plants/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEME
 });
 
 // ----------------- TOILETS -----------------
-router.delete('/toilets/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), (req, res) => {
+router.delete('/toilets/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT'), async (req, res) => {
   const { id } = req.params;
-  const toilet = db.get('SELECT * FROM toilets WHERE id = ?', [id]);
+  const toilet = await db.get('SELECT * FROM toilets WHERE id = ?', [id]);
   if (!toilet) {
     return res.status(404).json({ success: false, error: 'Toilet facility not found' });
   }
 
   try {
-    db.run('DELETE FROM qr_codes WHERE toilet_id = ?', [id]);
-    db.run('DELETE FROM evidence_photos WHERE session_id IN (SELECT id FROM cleaning_sessions WHERE toilet_id = ?)', [id]);
-    db.run('DELETE FROM checklist_responses WHERE session_id IN (SELECT id FROM cleaning_sessions WHERE toilet_id = ?)', [id]);
-    db.run('DELETE FROM cleaning_sessions WHERE toilet_id = ?', [id]);
-    db.run('DELETE FROM supervisor_inspections WHERE toilet_id = ?', [id]);
-    db.run('DELETE FROM issues WHERE toilet_id = ?', [id]);
-    db.run('DELETE FROM assignments WHERE toilet_id = ?', [id]);
-    db.run('DELETE FROM toilets WHERE id = ?', [id]);
+    await db.run('DELETE FROM qr_codes WHERE toilet_id = ?', [id]);
+    await db.run('DELETE FROM evidence_photos WHERE session_id IN (SELECT id FROM cleaning_sessions WHERE toilet_id = ?)', [id]);
+    await db.run('DELETE FROM checklist_responses WHERE session_id IN (SELECT id FROM cleaning_sessions WHERE toilet_id = ?)', [id]);
+    await db.run('DELETE FROM cleaning_sessions WHERE toilet_id = ?', [id]);
+    await db.run('DELETE FROM supervisor_inspections WHERE toilet_id = ?', [id]);
+    await db.run('DELETE FROM issues WHERE toilet_id = ?', [id]);
+    await db.run('DELETE FROM assignments WHERE toilet_id = ?', [id]);
+    await db.run('DELETE FROM toilets WHERE id = ?', [id]);
 
-    auditLogFromReq(req, 'TOILET_DELETED', 'TOILET', toilet.code, {
+    await auditLogFromReq(req, 'TOILET_DELETED', 'TOILET', toilet.code, {
       toilet_id: id,
       name: toilet.name,
       plant_id: toilet.plant_id
@@ -160,7 +160,7 @@ router.delete('/toilets/:id', requireRole('SUPER_ADMIN', 'PLANT_ADMIN', 'MANAGEM
     res.status(500).json({ success: false, error: 'Failed to delete facility: ' + err.message });
   }
 });
-router.get('/toilets', (req, res) => {
+router.get('/toilets', async (req, res) => {
   let query = `
     SELECT t.*, p.name as plant_name, p.code as plant_code,
            b.name as building_name, f.name as floor_name, a.name as area_name
@@ -180,11 +180,11 @@ router.get('/toilets', (req, res) => {
     params.push(req.user.plant_id);
   }
   query += ' ORDER BY a.name ASC, t.code ASC';
-  const toilets = db.all(query, params);
+  const toilets = await db.all(query, params);
   res.json({ success: true, toilets });
 });
 
-router.post('/toilets', (req, res) => {
+router.post('/toilets', async (req, res) => {
   const { plantId, areaId, areaName, code, name, gender = 'UNISEX' } = req.body;
   if (!plantId || (!areaId && !areaName) || !code || !name) {
     return res.status(400).json({ success: false, error: 'plantId, area (areaId or areaName), code and name are required' });
@@ -196,7 +196,7 @@ router.post('/toilets', (req, res) => {
   try {
     let targetAreaId = areaId;
     if (!targetAreaId && areaName) {
-      let area = db.get(`
+      let area = await db.get(`
         SELECT a.id FROM areas a
         JOIN floors f ON a.floor_id = f.id
         JOIN buildings b ON f.building_id = b.id
@@ -206,31 +206,31 @@ router.post('/toilets', (req, res) => {
       if (area) {
         targetAreaId = area.id;
       } else {
-        let bld = db.get('SELECT id FROM buildings WHERE plant_id = ? LIMIT 1', [plantId]);
+        let bld = await db.get('SELECT id FROM buildings WHERE plant_id = ? LIMIT 1', [plantId]);
         if (!bld) {
-          const bRes = db.run('INSERT INTO buildings (plant_id, code, name) VALUES (?, ?, ?)', [plantId, 'BLD-01', 'Main Facility']);
+          const bRes = await db.run('INSERT INTO buildings (plant_id, code, name) VALUES (?, ?, ?)', [plantId, 'BLD-01', 'Main Facility']);
           bld = { id: bRes.lastInsertRowid };
         }
-        let fl = db.get('SELECT id FROM floors WHERE building_id = ? LIMIT 1', [bld.id]);
+        let fl = await db.get('SELECT id FROM floors WHERE building_id = ? LIMIT 1', [bld.id]);
         if (!fl) {
-          const fRes = db.run('INSERT INTO floors (building_id, code, name, floor_number) VALUES (?, ?, ?, 0)', [bld.id, 'FL-00', 'Ground Floor']);
+          const fRes = await db.run('INSERT INTO floors (building_id, code, name, floor_number) VALUES (?, ?, ?, 0)', [bld.id, 'FL-00', 'Ground Floor']);
           fl = { id: fRes.lastInsertRowid };
         }
         const areaCode = 'AREA-' + Date.now().toString().slice(-4);
-        const aRes = db.run('INSERT INTO areas (floor_id, code, name) VALUES (?, ?, ?)', [fl.id, areaCode, areaName.trim()]);
+        const aRes = await db.run('INSERT INTO areas (floor_id, code, name) VALUES (?, ?, ?)', [fl.id, areaCode, areaName.trim()]);
         targetAreaId = aRes.lastInsertRowid;
       }
     }
 
-    const resToilet = db.run(`
+    const resToilet = await db.run(`
       INSERT INTO toilets (plant_id, area_id, code, name, gender, qr_token, status)
       VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')
     `, [plantId, targetAreaId, code.toUpperCase().trim(), name.trim(), gender, qrToken]);
 
     const toiletId = resToilet.lastInsertRowid;
-    db.run('INSERT INTO qr_codes (toilet_id, token, is_active) VALUES (?, ?, 1)', [toiletId, qrToken]);
+    await db.run('INSERT INTO qr_codes (toilet_id, token, is_active) VALUES (?, ?, 1)', [toiletId, qrToken]);
 
-    auditLogFromReq(req, 'TOILET_CREATED', 'TOILET', code, { toilet_id: toiletId, name });
+    await auditLogFromReq(req, 'TOILET_CREATED', 'TOILET', code, { toilet_id: toiletId, name });
 
     res.json({ success: true, toiletId, qrToken, message: 'Toilet created successfully with active opaque QR token' });
   } catch (err) {
@@ -239,7 +239,7 @@ router.post('/toilets', (req, res) => {
 });
 
 // ----------------- USERS -----------------
-router.get('/users', (req, res) => {
+router.get('/users', async (req, res) => {
   let query = `
     SELECT u.id, u.employee_id, u.name, u.email, u.role, u.plant_id, u.phone, u.is_active, u.created_at,
            p.name as plant_name, p.code as plant_code, p.location as plant_location
@@ -253,7 +253,7 @@ router.get('/users', (req, res) => {
     params.push(req.user.plant_id);
   }
   query += ' ORDER BY u.role, u.name ASC';
-  const users = db.all(query, params);
+  const users = await db.all(query, params);
   res.json({ success: true, users });
 });
 
@@ -266,12 +266,12 @@ router.post('/users', async (req, res) => {
   try {
     const finalPassword = (password && password.trim()) ? password.trim() : ('OTP_AUTH_' + crypto.randomBytes(8).toString('hex'));
     const passwordHash = await bcrypt.hash(finalPassword, 10);
-    const result = db.run(`
+    const result = await db.run(`
       INSERT INTO users (employee_id, name, email, password_hash, role, plant_id, phone)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `, [employeeId.trim(), name.trim(), email.trim().toLowerCase(), passwordHash, role, plantId || null, phone || '']);
 
-    auditLogFromReq(req, 'USER_CREATED', 'USER', employeeId, { role, plantId });
+    await auditLogFromReq(req, 'USER_CREATED', 'USER', employeeId, { role, plantId });
     res.json({ success: true, userId: result.lastInsertRowid, message: 'User created successfully' });
   } catch (err) {
     res.status(400).json({ success: false, error: 'Email or Employee ID already exists: ' + err.message });
@@ -282,7 +282,7 @@ router.put('/users/:id', async (req, res) => {
   const userId = req.params.id;
   const { name, email, role, plantId, phone, password } = req.body;
   
-  const existing = db.get('SELECT * FROM users WHERE id = ?', [userId]);
+  const existing = await db.get('SELECT * FROM users WHERE id = ?', [userId]);
   if (!existing) return res.status(404).json({ success: false, error: 'User not found' });
 
   let normalizedRole = role || existing.role;
@@ -293,7 +293,7 @@ router.put('/users/:id', async (req, res) => {
     const finalPlantId = (plantId === 'all' || plantId === '' || plantId === null || plantId === undefined) ? null : Number(plantId);
     if (password && password.trim()) {
       const passwordHash = await bcrypt.hash(password.trim(), 10);
-      db.run(`
+      await db.run(`
         UPDATE users 
         SET name = ?, email = ?, role = ?, plant_id = ?, phone = ?, password_hash = ?
         WHERE id = ?
@@ -307,7 +307,7 @@ router.put('/users/:id', async (req, res) => {
         userId
       ]);
     } else {
-      db.run(`
+      await db.run(`
         UPDATE users 
         SET name = ?, email = ?, role = ?, plant_id = ?, phone = ?
         WHERE id = ?
@@ -321,28 +321,28 @@ router.put('/users/:id', async (req, res) => {
       ]);
     }
 
-    auditLogFromReq(req, 'USER_UPDATED', 'USER', existing.employee_id, { role: normalizedRole, plant_id: finalPlantId });
+    await auditLogFromReq(req, 'USER_UPDATED', 'USER', existing.employee_id, { role: normalizedRole, plant_id: finalPlantId });
     res.json({ success: true, message: 'User updated successfully' });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
   }
 });
 
-router.post('/users/:id/toggle-status', (req, res) => {
+router.post('/users/:id/toggle-status', async (req, res) => {
   const userId = req.params.id;
-  const user = db.get('SELECT id, is_active, employee_id FROM users WHERE id = ?', [userId]);
+  const user = await db.get('SELECT id, is_active, employee_id FROM users WHERE id = ?', [userId]);
   if (!user) return res.status(404).json({ success: false, error: 'User not found' });
 
   const newStatus = user.is_active ? 0 : 1;
-  db.run('UPDATE users SET is_active = ? WHERE id = ?', [newStatus, userId]);
+  await db.run('UPDATE users SET is_active = ? WHERE id = ?', [newStatus, userId]);
 
-  auditLogFromReq(req, 'USER_STATUS_TOGGLED', 'USER', user.employee_id, { newStatus });
+  await auditLogFromReq(req, 'USER_STATUS_TOGGLED', 'USER', user.employee_id, { newStatus });
   res.json({ success: true, is_active: newStatus, message: `User status changed to ${newStatus ? 'ACTIVE' : 'INACTIVE'}` });
 });
 
-router.delete('/users/:id', (req, res) => {
+router.delete('/users/:id', async (req, res) => {
   const userId = req.params.id;
-  const user = db.get('SELECT id, employee_id, name, role FROM users WHERE id = ?', [userId]);
+  const user = await db.get('SELECT id, employee_id, name, role FROM users WHERE id = ?', [userId]);
   if (!user) return res.status(404).json({ success: false, error: 'User not found' });
 
   // Prevent self deletion
@@ -352,11 +352,11 @@ router.delete('/users/:id', (req, res) => {
 
   try {
     // Delete related assignments
-    db.run('DELETE FROM assignments WHERE user_id = ?', [userId]);
+    await db.run('DELETE FROM assignments WHERE user_id = ?', [userId]);
     // Delete user
-    db.run('DELETE FROM users WHERE id = ?', [userId]);
+    await db.run('DELETE FROM users WHERE id = ?', [userId]);
 
-    auditLogFromReq(req, 'USER_DELETED', 'USER', user.employee_id, { name: user.name, role: user.role });
+    await auditLogFromReq(req, 'USER_DELETED', 'USER', user.employee_id, { name: user.name, role: user.role });
     res.json({ success: true, message: `User "${user.name}" (${user.employee_id}) deleted successfully` });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
@@ -364,7 +364,7 @@ router.delete('/users/:id', (req, res) => {
 });
 
 // ----------------- HIERARCHY: BUILDINGS, FLOORS, AREAS -----------------
-router.get('/buildings', (req, res) => {
+router.get('/buildings', async (req, res) => {
   const { plantId } = req.query;
   let query = 'SELECT b.*, p.name as plant_name FROM buildings b JOIN plants p ON b.plant_id = p.id WHERE 1=1';
   const params = [];
@@ -373,24 +373,24 @@ router.get('/buildings', (req, res) => {
     params.push(Number(plantId));
   }
   query += ' ORDER BY b.name ASC';
-  const buildings = db.all(query, params);
+  const buildings = await db.all(query, params);
   res.json({ success: true, buildings });
 });
 
-router.post('/buildings', (req, res) => {
+router.post('/buildings', async (req, res) => {
   const { plantId, code, name } = req.body;
   if (!plantId || !code || !name) {
     return res.status(400).json({ success: false, error: 'plantId, code, and name are required' });
   }
   try {
-    const r = db.run('INSERT INTO buildings (plant_id, code, name) VALUES (?, ?, ?)', [plantId, code.toUpperCase().trim(), name.trim()]);
+    const r = await db.run('INSERT INTO buildings (plant_id, code, name) VALUES (?, ?, ?)', [plantId, code.toUpperCase().trim(), name.trim()]);
     res.json({ success: true, buildingId: r.lastInsertRowid, message: 'Building created successfully' });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
   }
 });
 
-router.get('/blocks', (req, res) => {
+router.get('/blocks', async (req, res) => {
   const { buildingId } = req.query;
   let query = 'SELECT bl.*, b.name as building_name FROM blocks bl JOIN buildings b ON bl.building_id = b.id WHERE 1=1';
   const params = [];
@@ -399,24 +399,24 @@ router.get('/blocks', (req, res) => {
     params.push(Number(buildingId));
   }
   query += ' ORDER BY bl.name ASC';
-  res.json({ success: true, blocks: db.all(query, params) });
+  res.json({ success: true, blocks: await db.all(query, params) });
 });
 
-router.post('/blocks', (req, res) => {
+router.post('/blocks', async (req, res) => {
   const { buildingId, code, name } = req.body;
   if (!buildingId || !code || !name) {
     return res.status(400).json({ success: false, error: 'buildingId, code, and name are required' });
   }
   try {
-    const r = db.run('INSERT INTO blocks (building_id, code, name) VALUES (?, ?, ?)', [Number(buildingId), code.toUpperCase().trim(), name.trim()]);
-    auditLogFromReq(req, 'BLOCK_CREATED', 'BLOCK', code, { building_id: buildingId, name });
+    const r = await db.run('INSERT INTO blocks (building_id, code, name) VALUES (?, ?, ?)', [Number(buildingId), code.toUpperCase().trim(), name.trim()]);
+    await auditLogFromReq(req, 'BLOCK_CREATED', 'BLOCK', code, { building_id: buildingId, name });
     res.json({ success: true, blockId: r.lastInsertRowid, message: 'Block created successfully' });
   } catch (err) {
-    res.status(400).json({ success: false, error: err.message.includes('UNIQUE') ? 'A block with this code already exists in this building.' : err.message });
+    res.status(400).json({ success: false, error: /UNIQUE|duplicate key/i.test(err.message) ? 'A block with this code already exists in this building.' : err.message });
   }
 });
 
-router.get('/floors', (req, res) => {
+router.get('/floors', async (req, res) => {
   const { buildingId, blockId } = req.query;
   let query = `SELECT f.*, b.name as building_name, b.plant_id, p.name as plant_name, bl.name as block_name
                FROM floors f JOIN buildings b ON f.building_id = b.id JOIN plants p ON b.plant_id = p.id
@@ -431,24 +431,24 @@ router.get('/floors', (req, res) => {
     params.push(Number(blockId));
   }
   query += ' ORDER BY f.floor_number ASC, f.name ASC';
-  const floors = db.all(query, params);
+  const floors = await db.all(query, params);
   res.json({ success: true, floors });
 });
 
-router.post('/floors', (req, res) => {
+router.post('/floors', async (req, res) => {
   const { buildingId, blockId, code, name, floorNumber = 0 } = req.body;
   if (!buildingId || !code || !name) {
     return res.status(400).json({ success: false, error: 'buildingId, code, and name are required' });
   }
   try {
     let finalCode = code.toUpperCase().trim();
-    const block = blockId ? db.get('SELECT code FROM blocks WHERE id = ? AND building_id = ?', [Number(blockId), Number(buildingId)]) : null;
+    const block = blockId ? await db.get('SELECT code FROM blocks WHERE id = ? AND building_id = ?', [Number(blockId), Number(buildingId)]) : null;
     if (blockId && !block) return res.status(400).json({ success: false, error: 'Selected block does not belong to this building' });
     // Floor codes are unique per building, so the same floor in two blocks gets the block code as prefix
-    if (block && db.get('SELECT id FROM floors WHERE building_id = ? AND code = ?', [Number(buildingId), finalCode])) {
+    if (block && await db.get('SELECT id FROM floors WHERE building_id = ? AND code = ?', [Number(buildingId), finalCode])) {
       finalCode = `${block.code}-${finalCode}`;
     }
-    const r = db.run('INSERT INTO floors (building_id, block_id, code, name, floor_number) VALUES (?, ?, ?, ?, ?)',
+    const r = await db.run('INSERT INTO floors (building_id, block_id, code, name, floor_number) VALUES (?, ?, ?, ?, ?)',
       [buildingId, block ? Number(blockId) : null, finalCode, name.trim(), floorNumber]);
     res.json({ success: true, floorId: r.lastInsertRowid, message: 'Floor created successfully' });
   } catch (err) {
@@ -456,7 +456,7 @@ router.post('/floors', (req, res) => {
   }
 });
 
-router.get('/areas', (req, res) => {
+router.get('/areas', async (req, res) => {
   const { floorId } = req.query;
   let query = 'SELECT a.*, f.name as floor_name, b.name as building_name, b.plant_id, p.name as plant_name FROM areas a JOIN floors f ON a.floor_id = f.id JOIN buildings b ON f.building_id = b.id JOIN plants p ON b.plant_id = p.id WHERE 1=1';
   const params = [];
@@ -465,17 +465,17 @@ router.get('/areas', (req, res) => {
     params.push(Number(floorId));
   }
   query += ' ORDER BY a.name ASC';
-  const areas = db.all(query, params);
+  const areas = await db.all(query, params);
   res.json({ success: true, areas });
 });
 
-router.post('/areas', (req, res) => {
+router.post('/areas', async (req, res) => {
   const { floorId, code, name, assignedUserId } = req.body;
   if (!floorId || !code || !name) {
     return res.status(400).json({ success: false, error: 'floorId, code, and name are required' });
   }
   try {
-    const r = db.run(
+    const r = await db.run(
       'INSERT INTO areas (floor_id, code, name, assigned_user_id) VALUES (?, ?, ?, ?)',
       [floorId, code.toUpperCase().trim(), name.trim(), assignedUserId ? Number(assignedUserId) : null]
     );
@@ -486,7 +486,7 @@ router.post('/areas', (req, res) => {
 });
 
 // ----------------- QR MASTER -----------------
-router.get('/qr-master', (req, res) => {
+router.get('/qr-master', async (req, res) => {
   let query = `
     SELECT t.id, t.code, t.name, t.gender, t.status, t.qr_token, t.is_active, t.assigned_user_id,
            t.toilet_uid, t.urinal_count, t.wc_count, t.basin_count, t.drinking_water_nearby, t.supervisor_id, t.cleaning_frequency,
@@ -515,27 +515,27 @@ router.get('/qr-master', (req, res) => {
     params.push(req.user.plant_id);
   }
   query += ' ORDER BY p.name, b.name, f.floor_number, t.code ASC';
-  const qrMasterList = db.all(query, params);
+  const qrMasterList = await db.all(query, params);
   res.json({ success: true, qrList: qrMasterList });
 });
 
-router.post('/qr-master/generate-qr', (req, res) => {
+router.post('/qr-master/generate-qr', async (req, res) => {
   const { toiletId } = req.body;
   if (!toiletId) return res.status(400).json({ success: false, error: 'toiletId is required' });
 
-  const toilet = db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
+  const toilet = await db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
   if (!toilet) return res.status(404).json({ success: false, error: 'Toilet not found' });
 
   // Invalidate previous active QR
-  db.run('UPDATE qr_codes SET is_active = 0, disabled_at = CURRENT_TIMESTAMP WHERE toilet_id = ?', [toiletId]);
+  await db.run('UPDATE qr_codes SET is_active = 0, disabled_at = CURRENT_TIMESTAMP WHERE toilet_id = ?', [toiletId]);
 
   // Generate cryptographically unique opaque token
   const newToken = 'H360-QR-' + crypto.randomBytes(8).toString('hex').toUpperCase();
 
-  db.run('UPDATE toilets SET qr_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newToken, toiletId]);
-  db.run('INSERT INTO qr_codes (toilet_id, token, is_active, regenerated_at) VALUES (?, ?, 1, CURRENT_TIMESTAMP)', [toiletId, newToken]);
+  await db.run('UPDATE toilets SET qr_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newToken, toiletId]);
+  await db.run('INSERT INTO qr_codes (toilet_id, token, is_active, regenerated_at) VALUES (?, ?, 1, CURRENT_TIMESTAMP)', [toiletId, newToken]);
 
-  auditLogFromReq(req, 'QR_REASSIGNED', 'TOILET', toilet.code, {
+  await auditLogFromReq(req, 'QR_REASSIGNED', 'TOILET', toilet.code, {
     old_token_prefix: toilet.qr_token.slice(0, 10),
     new_token_prefix: newToken.slice(0, 10)
   });
@@ -555,14 +555,14 @@ function toCount(v) {
 }
 
 // Master fields shared by create and edit; returns { values, error }
-function readToiletMaster(body) {
+async function readToiletMaster(body) {
   const frequency = body.cleaningFrequency ? String(body.cleaningFrequency).toUpperCase() : null;
   if (frequency && !CLEANING_FREQUENCIES.includes(frequency)) {
     return { error: 'Invalid cleaning frequency' };
   }
   let supervisorId = null;
   if (body.supervisorId) {
-    const sup = db.get('SELECT id, role FROM users WHERE id = ? AND is_active = 1', [Number(body.supervisorId)]);
+    const sup = await db.get('SELECT id, role FROM users WHERE id = ? AND is_active = 1', [Number(body.supervisorId)]);
     if (!sup || !['SUPERVISOR', 'PLANT_ADMIN', 'SUPER_ADMIN', 'IT_ADMIN'].includes(sup.role)) {
       return { error: 'Selected supervisor is not an active supervisor or admin' };
     }
@@ -580,8 +580,8 @@ function readToiletMaster(body) {
   };
 }
 
-function autoToiletUid(areaId, toiletCode, excludeId = null) {
-  const loc = db.get(`
+async function autoToiletUid(areaId, toiletCode, excludeId = null) {
+  const loc = await db.get(`
     SELECT p.code as plant_code, bl.code as block_code, b.code as building_code
     FROM areas a JOIN floors f ON a.floor_id = f.id JOIN buildings b ON f.building_id = b.id JOIN plants p ON b.plant_id = p.id
     LEFT JOIN blocks bl ON f.block_id = bl.id
@@ -596,7 +596,7 @@ function normalizeToiletUid(raw) {
   return uid.startsWith('TOILET-') ? uid : (uid ? `TOILET-${uid}` : '');
 }
 
-router.post('/qr-master/create-facility', (req, res) => {
+router.post('/qr-master/create-facility', async (req, res) => {
   const { plantId, areaId, code, name, gender = 'MALE', assignedUserId, toiletUid } = req.body;
   if (!plantId || !areaId || !code || !name) {
     return res.status(400).json({ success: false, error: 'Plant, Area, Toilet Code, and Toilet Name are required' });
@@ -604,7 +604,7 @@ router.post('/qr-master/create-facility', (req, res) => {
   if (!['MALE', 'FEMALE'].includes(String(gender).toUpperCase())) {
     return res.status(400).json({ success: false, error: 'Toilet type must be MALE or FEMALE' });
   }
-  const master = readToiletMaster(req.body);
+  const master = await readToiletMaster(req.body);
   if (master.error) return res.status(400).json({ success: false, error: master.error });
 
   const qrToken = 'H360-QR-' + crypto.randomBytes(8).toString('hex').toUpperCase();
@@ -612,12 +612,12 @@ router.post('/qr-master/create-facility', (req, res) => {
   try {
     const finalAssignedUserId = assignedUserId ? Number(assignedUserId) : null;
     const requestedUid = normalizeToiletUid(toiletUid);
-    if (requestedUid && db.get('SELECT id FROM toilets WHERE toilet_uid = ?', [requestedUid])) {
+    if (requestedUid && await db.get('SELECT id FROM toilets WHERE toilet_uid = ?', [requestedUid])) {
       return res.status(400).json({ success: false, error: `Toilet ID ${requestedUid} is already used by another toilet` });
     }
-    const finalUid = requestedUid || autoToiletUid(areaId, code);
+    const finalUid = requestedUid || await autoToiletUid(areaId, code);
     const m = master.values;
-    const resToilet = db.run(`
+    const resToilet = await db.run(`
       INSERT INTO toilets (plant_id, area_id, code, name, gender, qr_token, status, assigned_user_id, toilet_uid,
                            urinal_count, wc_count, basin_count, drinking_water_nearby, supervisor_id, cleaning_frequency)
       VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?)
@@ -625,20 +625,21 @@ router.post('/qr-master/create-facility', (req, res) => {
         m.urinalCount, m.wcCount, m.basinCount, m.drinkingWaterNearby, m.supervisorId, m.cleaningFrequency]);
 
     const toiletId = resToilet.lastInsertRowid;
-    db.run('INSERT INTO qr_codes (toilet_id, token, is_active) VALUES (?, ?, 1)', [toiletId, qrToken]);
+    await db.run('INSERT INTO qr_codes (toilet_id, token, is_active) VALUES (?, ?, 1)', [toiletId, qrToken]);
 
     if (finalAssignedUserId) {
       try {
-        db.run(`
-          INSERT OR REPLACE INTO assignments (user_id, toilet_id, assigned_date)
+        await db.run(`
+          INSERT INTO assignments (user_id, toilet_id, assigned_date)
           VALUES (?, ?, DATE('now'))
+          ON CONFLICT (user_id, toilet_id, assigned_date) DO NOTHING
         `, [finalAssignedUserId, toiletId]);
       } catch (e) {
         console.warn('Assignment notice:', e.message);
       }
     }
 
-    auditLogFromReq(req, 'FACILITY_AND_QR_CREATED', 'TOILET', code, { toilet_id: toiletId, name, plant_id: plantId, assigned_user_id: finalAssignedUserId, toilet_uid: finalUid });
+    await auditLogFromReq(req, 'FACILITY_AND_QR_CREATED', 'TOILET', code, { toilet_id: toiletId, name, plant_id: plantId, assigned_user_id: finalAssignedUserId, toilet_uid: finalUid });
 
     res.json({
       success: true,
@@ -653,15 +654,15 @@ router.post('/qr-master/create-facility', (req, res) => {
 });
 
 // Edit toilet master information (Toilet ID, fixtures, drinking water, responsible person, supervisor, frequency)
-router.put('/qr-master/:id/master', (req, res) => {
+router.put('/qr-master/:id/master', async (req, res) => {
   const toiletId = Number(req.params.id);
-  const toilet = db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
+  const toilet = await db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
   if (!toilet) return res.status(404).json({ success: false, error: 'Toilet not found' });
   if (req.user.role === 'PLANT_ADMIN' && req.user.plant_id && req.user.plant_id !== toilet.plant_id) {
     return res.status(403).json({ success: false, error: 'You can only edit toilets of your plant' });
   }
 
-  const master = readToiletMaster(req.body);
+  const master = await readToiletMaster(req.body);
   if (master.error) return res.status(400).json({ success: false, error: master.error });
 
   const name = req.body.name ? String(req.body.name).trim() : toilet.name;
@@ -673,8 +674,8 @@ router.put('/qr-master/:id/master', (req, res) => {
   let uid = toilet.toilet_uid;
   if (req.body.toiletUid !== undefined) {
     const requested = normalizeToiletUid(req.body.toiletUid);
-    uid = requested || autoToiletUid(toilet.area_id, toilet.code, toiletId);
-    if (db.get('SELECT id FROM toilets WHERE toilet_uid = ? AND id != ?', [uid, toiletId])) {
+    uid = requested || await autoToiletUid(toilet.area_id, toilet.code, toiletId);
+    if (await db.get('SELECT id FROM toilets WHERE toilet_uid = ? AND id != ?', [uid, toiletId])) {
       return res.status(400).json({ success: false, error: `Toilet ID ${uid} is already used by another toilet` });
     }
   }
@@ -683,7 +684,7 @@ router.put('/qr-master/:id/master', (req, res) => {
   if (req.body.assignedUserId !== undefined) {
     assignedUserId = null;
     if (req.body.assignedUserId) {
-      const staff = db.get('SELECT id, role FROM users WHERE id = ? AND is_active = 1', [Number(req.body.assignedUserId)]);
+      const staff = await db.get('SELECT id, role FROM users WHERE id = ? AND is_active = 1', [Number(req.body.assignedUserId)]);
       if (!staff || !['HOUSEKEEPING', 'HOUSEKEEPING_AGENT'].includes(staff.role)) {
         return res.status(400).json({ success: false, error: 'Responsible person must be an active housekeeping staff member' });
       }
@@ -692,20 +693,20 @@ router.put('/qr-master/:id/master', (req, res) => {
   }
 
   const m = master.values;
-  db.run(`
+  await db.run(`
     UPDATE toilets SET name = ?, gender = ?, toilet_uid = ?, assigned_user_id = ?, urinal_count = ?, wc_count = ?, basin_count = ?,
                        drinking_water_nearby = ?, supervisor_id = ?, cleaning_frequency = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `, [name, gender, uid, assignedUserId, m.urinalCount, m.wcCount, m.basinCount, m.drinkingWaterNearby, m.supervisorId, m.cleaningFrequency, toiletId]);
 
   if (assignedUserId !== toilet.assigned_user_id) {
-    db.run("DELETE FROM assignments WHERE toilet_id = ? AND assigned_date = DATE('now')", [toiletId]);
+    await db.run("DELETE FROM assignments WHERE toilet_id = ? AND assigned_date = DATE('now')", [toiletId]);
     if (assignedUserId) {
-      db.run("INSERT OR IGNORE INTO assignments (user_id, toilet_id, assigned_date) VALUES (?, ?, DATE('now'))", [assignedUserId, toiletId]);
+      await db.run("INSERT OR IGNORE INTO assignments (user_id, toilet_id, assigned_date) VALUES (?, ?, DATE('now'))", [assignedUserId, toiletId]);
     }
   }
 
-  auditLogFromReq(req, 'TOILET_MASTER_UPDATED', 'TOILET', toilet.code, {
+  await auditLogFromReq(req, 'TOILET_MASTER_UPDATED', 'TOILET', toilet.code, {
     toilet_id: toiletId,
     toilet_uid: uid,
     assigned_user_id: assignedUserId,
@@ -716,30 +717,30 @@ router.put('/qr-master/:id/master', (req, res) => {
 });
 
 // Change the housekeeper responsible for a toilet (one housekeeper can own many toilets)
-router.patch('/qr-master/:id/assign', (req, res) => {
+router.patch('/qr-master/:id/assign', async (req, res) => {
   const toiletId = Number(req.params.id);
   const { assignedUserId } = req.body;
 
-  const toilet = db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
+  const toilet = await db.get('SELECT * FROM toilets WHERE id = ?', [toiletId]);
   if (!toilet) return res.status(404).json({ success: false, error: 'Toilet not found' });
 
   let newUserId = null;
   let staff = null;
   if (assignedUserId) {
-    staff = db.get("SELECT id, name, employee_id, role FROM users WHERE id = ? AND is_active = 1", [Number(assignedUserId)]);
+    staff = await db.get("SELECT id, name, employee_id, role FROM users WHERE id = ? AND is_active = 1", [Number(assignedUserId)]);
     if (!staff || !['HOUSEKEEPING', 'HOUSEKEEPING_AGENT'].includes(staff.role)) {
       return res.status(400).json({ success: false, error: 'Selected user is not an active housekeeping staff member' });
     }
     newUserId = staff.id;
   }
 
-  db.run('UPDATE toilets SET assigned_user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newUserId, toiletId]);
-  db.run("DELETE FROM assignments WHERE toilet_id = ? AND assigned_date = DATE('now')", [toiletId]);
+  await db.run('UPDATE toilets SET assigned_user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newUserId, toiletId]);
+  await db.run("DELETE FROM assignments WHERE toilet_id = ? AND assigned_date = DATE('now')", [toiletId]);
   if (newUserId) {
-    db.run("INSERT OR IGNORE INTO assignments (user_id, toilet_id, assigned_date) VALUES (?, ?, DATE('now'))", [newUserId, toiletId]);
+    await db.run("INSERT OR IGNORE INTO assignments (user_id, toilet_id, assigned_date) VALUES (?, ?, DATE('now'))", [newUserId, toiletId]);
   }
 
-  auditLogFromReq(req, 'TOILET_STAFF_ASSIGNED', 'TOILET', toilet.code, {
+  await auditLogFromReq(req, 'TOILET_STAFF_ASSIGNED', 'TOILET', toilet.code, {
     toilet_id: toiletId,
     from_user_id: toilet.assigned_user_id,
     to_user_id: newUserId
@@ -752,47 +753,47 @@ router.patch('/qr-master/:id/assign', (req, res) => {
 });
 
 // ----------------- SHIFTS -----------------
-router.get('/shifts', (req, res) => {
-  const shifts = db.all('SELECT s.*, p.name as plant_name FROM shifts s JOIN plants p ON s.plant_id = p.id ORDER BY s.start_time ASC');
+router.get('/shifts', async (req, res) => {
+  const shifts = await db.all('SELECT s.*, p.name as plant_name FROM shifts s JOIN plants p ON s.plant_id = p.id ORDER BY s.start_time ASC');
   res.json({ success: true, shifts });
 });
 
 // ----------------- SYSTEM SETTINGS -----------------
-router.get('/settings', (req, res) => {
-  const settings = db.all('SELECT * FROM system_settings');
+router.get('/settings', async (req, res) => {
+  const settings = await db.all('SELECT * FROM system_settings');
   res.json({ success: true, settings });
 });
 
-router.post('/settings', requireRole('SUPER_ADMIN'), (req, res) => {
+router.post('/settings', requireRole('SUPER_ADMIN'), async (req, res) => {
   const { key, value } = req.body;
-  db.run(`
+  await db.run(`
     INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
   `, [key, value]);
-  auditLogFromReq(req, 'SETTING_UPDATED', 'SYSTEM', key, { value });
+  await auditLogFromReq(req, 'SETTING_UPDATED', 'SYSTEM', key, { value });
   res.json({ success: true, message: 'Setting updated successfully' });
 });
 
 // ----------------- WHATSAPP ALERTS -----------------
 const WHATSAPP_KEYS = ['whatsapp_alert_missed', 'whatsapp_alert_late', 'whatsapp_alert_summary', 'whatsapp_summary_time'];
 
-router.get('/whatsapp', (req, res) => {
+router.get('/whatsapp', async (req, res) => {
   const whatsapp = require('../utils/whatsappService');
   const settings = {};
-  db.all(`SELECT key, value FROM system_settings WHERE key IN (${WHATSAPP_KEYS.map(() => '?').join(',')})`, WHATSAPP_KEYS)
-    .forEach(r => { settings[r.key] = r.value; });
+  const settingRows = await db.all(`SELECT key, value FROM system_settings WHERE key IN (${WHATSAPP_KEYS.map(() => '?').join(',')})`, WHATSAPP_KEYS);
+  for (const r of settingRows) settings[r.key] = r.value;
   const plantId = req.user.plant_id || null;
-  const recipients = db.all(`
+  const recipients = await db.all(`
     SELECT id, name, role, phone, plant_id FROM users
     WHERE is_active = 1 AND role IN ('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMIN', 'PLANT_HEAD')
       ${plantId ? 'AND (plant_id = ? OR plant_id IS NULL)' : ''}
     ORDER BY role, name
   `, plantId ? [plantId] : []);
-  const logs = db.all('SELECT id, user_id, phone, kind, message, status, error, created_at FROM whatsapp_log ORDER BY id DESC LIMIT 100');
+  const logs = await db.all('SELECT id, user_id, phone, kind, message, status, error, created_at FROM whatsapp_log ORDER BY id DESC LIMIT 100');
   res.json({ success: true, provider: whatsapp.providerName(), settings, recipients, logs });
 });
 
-router.put('/whatsapp', requireRole('SUPER_ADMIN', 'PLANT_ADMIN'), (req, res) => {
+router.put('/whatsapp', requireRole('SUPER_ADMIN', 'PLANT_ADMIN'), async (req, res) => {
   for (const key of WHATSAPP_KEYS) {
     if (req.body[key] === undefined) continue;
     let value = String(req.body[key]);
@@ -801,9 +802,9 @@ router.put('/whatsapp', requireRole('SUPER_ADMIN', 'PLANT_ADMIN'), (req, res) =>
     } else {
       value = value === '1' || value === 'true' ? '1' : '0';
     }
-    db.run('UPDATE system_settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?', [value, key]);
+    await db.run('UPDATE system_settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?', [value, key]);
   }
-  auditLogFromReq(req, 'WHATSAPP_SETTINGS_UPDATED', 'SETTINGS', 'whatsapp', req.body);
+  await auditLogFromReq(req, 'WHATSAPP_SETTINGS_UPDATED', 'SETTINGS', 'whatsapp', req.body);
   res.json({ success: true });
 });
 

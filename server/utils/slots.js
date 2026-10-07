@@ -42,7 +42,7 @@ function slotRange(slot) {
 }
 
 // Timings are managed location-wise and copied to every plant of that location
-function getPlantSlots(plantId) {
+async function getPlantSlots(plantId) {
   if (!plantId) return [];
   return db.all(
     'SELECT * FROM cleaning_slots WHERE plant_id = ? AND area_id IS NULL AND is_active = 1 ORDER BY start_time ASC',
@@ -50,11 +50,11 @@ function getPlantSlots(plantId) {
   );
 }
 
-function getToiletSlots(toilet) {
+async function getToiletSlots(toilet) {
   if (!toilet) return [];
   let plantId = toilet.plant_id;
   if (!plantId && toilet.id) {
-    plantId = db.get('SELECT plant_id FROM toilets WHERE id = ?', [toilet.id])?.plant_id;
+    plantId = (await db.get('SELECT plant_id FROM toilets WHERE id = ?', [toilet.id]))?.plant_id;
   }
   return getPlantSlots(plantId);
 }
@@ -72,7 +72,7 @@ function findNextSlot(slots, minutes) {
 }
 
 // A slot counts as done once a submission is pending or approved; a rejected one must be redone
-function getSlotDoneSession(toiletId, slotId, slotDate) {
+async function getSlotDoneSession(toiletId, slotId, slotDate) {
   return db.get(`
     SELECT cs.*, u.name as agent_name, u.employee_id as agent_emp_id
     FROM cleaning_sessions cs
@@ -83,7 +83,7 @@ function getSlotDoneSession(toiletId, slotId, slotDate) {
   `, [toiletId, slotId, slotDate]);
 }
 
-function getLatestSlotSession(toiletId, slotId, slotDate) {
+async function getLatestSlotSession(toiletId, slotId, slotDate) {
   return db.get(`
     SELECT cs.*, u.name as agent_name, u.employee_id as agent_emp_id
     FROM cleaning_sessions cs
@@ -121,8 +121,8 @@ function computeCellStatus(slot, session, slotDate, now = istNow()) {
  * Decide whether a housekeeper may start cleaning this toilet right now.
  * Returns { allowed, slot, code, error, nextSlot } — toilets with no slots configured are unrestricted.
  */
-function checkSlotWindow(toilet, now = istNow()) {
-  const slots = getToiletSlots(toilet);
+async function checkSlotWindow(toilet, now = istNow()) {
+  const slots = await getToiletSlots(toilet);
   if (slots.length === 0) return { allowed: true, slot: null, slotsConfigured: false };
 
   const current = findCurrentSlot(slots, now.minutes);
@@ -140,7 +140,7 @@ function checkSlotWindow(toilet, now = istNow()) {
     };
   }
 
-  const done = getSlotDoneSession(toilet.id, current.id, now.date);
+  const done = await getSlotDoneSession(toilet.id, current.id, now.date);
   if (done) {
     const afterCurrent = findNextSlot(slots, toMinutes(current.end_time) - 1);
     return {
@@ -162,10 +162,14 @@ function checkSlotWindow(toilet, now = istNow()) {
  * the running slot if not yet done, else the latest missed slot of today (submitted late),
  * else the next upcoming slot, else no slot (extra cleaning).
  */
-function resolveSlotForCleaning(toilet, now = istNow()) {
-  const slots = getToiletSlots(toilet);
+async function resolveSlotForCleaning(toilet, now = istNow()) {
+  const slots = await getToiletSlots(toilet);
   if (slots.length === 0) return { slot: null, late: false };
-  const notDone = s => !getSlotDoneSession(toilet.id, s.id, now.date);
+  const doneIds = new Set();
+  for (const s of slots) {
+    if (await getSlotDoneSession(toilet.id, s.id, now.date)) doneIds.add(s.id);
+  }
+  const notDone = s => !doneIds.has(s.id);
 
   const current = findCurrentSlot(slots, now.minutes);
   if (current && notDone(current)) return { slot: current, late: false };
@@ -185,19 +189,22 @@ function resolveSlotForCleaning(toilet, now = istNow()) {
  * Only a running or already-ended (missed) slot can be filled; a future slot never.
  * Returns { blocked, code, filledSlot, filledBy, filledAt, nextSlot } — toilets without slots are never blocked.
  */
-function getSlotAvailability(toilet, now = istNow()) {
-  const slots = getToiletSlots(toilet);
+async function getSlotAvailability(toilet, now = istNow()) {
+  const slots = await getToiletSlots(toilet);
   if (slots.length === 0) return { blocked: false };
 
-  const resolved = resolveSlotForCleaning(toilet, now).slot;
+  const resolved = (await resolveSlotForCleaning(toilet, now)).slot;
   if (resolved && toMinutes(resolved.start_time) <= now.minutes) return { blocked: false };
 
   const withRange = s => (s ? { id: s.id, label: s.label, start_time: s.start_time, end_time: s.end_time, range: slotRange(s) } : null);
-  const filled = slots
+  let filled = null;
+  const started = slots
     .filter(s => toMinutes(s.start_time) <= now.minutes)
-    .sort((a, b) => b.start_time.localeCompare(a.start_time))
-    .map(s => ({ slot: s, done: getSlotDoneSession(toilet.id, s.id, now.date) }))
-    .find(x => x.done);
+    .sort((a, b) => b.start_time.localeCompare(a.start_time));
+  for (const s of started) {
+    const done = await getSlotDoneSession(toilet.id, s.id, now.date);
+    if (done) { filled = { slot: s, done }; break; }
+  }
 
   if (!filled) {
     return {
@@ -225,14 +232,14 @@ function getSlotAvailability(toilet, now = istNow()) {
 
 const URINAL_PATTERN = /urinal/i;
 
-function getChecklistItemsForToilet(toilet) {
-  const items = db.all('SELECT * FROM checklist_items WHERE is_active = 1 ORDER BY order_num ASC');
+async function getChecklistItemsForToilet(toilet) {
+  const items = await db.all('SELECT * FROM checklist_items WHERE is_active = 1 ORDER BY order_num ASC');
   const gender = String(toilet?.gender || '').toUpperCase();
   if (gender === 'FEMALE') return items.filter(i => !URINAL_PATTERN.test(i.label));
   return items;
 }
 
-function getPlantAdminRecipients(plantId) {
+async function getPlantAdminRecipients(plantId) {
   return db.all(`
     SELECT id FROM users
     WHERE is_active = 1 AND (
@@ -242,8 +249,8 @@ function getPlantAdminRecipients(plantId) {
   `, [plantId]);
 }
 
-function notify(userId, title, message, type, metadata = {}) {
-  db.run(
+async function notify(userId, title, message, type, metadata = {}) {
+  await db.run(
     'INSERT INTO notifications (user_id, title, message, type, metadata_json) VALUES (?, ?, ?, ?, ?)',
     [userId, title, message, type, JSON.stringify(metadata)]
   );

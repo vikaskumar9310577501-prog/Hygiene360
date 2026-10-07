@@ -2,68 +2,86 @@ const express = require('express');
 const router = express.Router();
 const db = require('../database');
 const { authenticate } = require('../middleware/auth');
-const { calculatePlantCompliance } = require('../utils/complianceEngine');
+const { calculatePlantCompliance, calculateComplianceForDates } = require('../utils/complianceEngine');
+
+function numericId(value) {
+  if (value === undefined || value === null || value === '' || value === 'all') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function countsByDay(sql, params) {
+  const rows = await db.all(sql, params);
+  return new Map(rows.map(r => [r.d, Number(r.n) || 0]));
+}
 
 // 1. Day-Wise Achievement Matrix
-router.get('/day-wise', authenticate, (req, res) => {
-  const { plantId, startDate, endDate } = req.query;
+router.get('/day-wise', authenticate, async (req, res) => {
+  const { startDate, endDate } = req.query;
+  const plantId = numericId(req.query.plantId);
 
   const start = startDate ? new Date(startDate) : new Date(Date.now() - 13 * 86400000);
   const end = endDate ? new Date(endDate) : new Date();
 
-  const results = [];
+  const days = [];
   const curr = new Date(start);
-
   while (curr <= end) {
-    const dStr = curr.toISOString().slice(0, 10);
-    const comp = calculatePlantCompliance(plantId ? Number(plantId) : null, dStr);
+    days.push({
+      dStr: curr.toISOString().slice(0, 10),
+      displayDate: curr.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+    });
+    curr.setDate(curr.getDate() + 1);
+  }
 
-    // Count issues created on this date
-    let issSql = 'SELECT COUNT(*) as issues_count FROM issues WHERE date(created_at) = ?';
-    const issParams = [dStr];
-    if (plantId) {
-      issSql += ' AND plant_id = ?';
-      issParams.push(plantId);
-    }
-    const issRow = db.get(issSql, issParams);
+  const results = [];
+  if (days.length) {
+    const keys = days.map(d => d.dStr).sort();
+    const fromDate = keys[0];
+    const toDate = keys[keys.length - 1];
 
-    // Count issues resolved on this date
-    let resSql = 'SELECT COUNT(*) as resolved_count FROM issues WHERE date(resolved_at) = ?';
-    const resParams = [dStr];
-    if (plantId) {
-      resSql += ' AND plant_id = ?';
-      resParams.push(plantId);
-    }
-    const resRow = db.get(resSql, resParams);
+    const compByDay = await calculateComplianceForDates(plantId, fromDate, toDate);
 
-    // Count inspections on this date
+    let issSql = 'SELECT date(created_at) as d, COUNT(*) as n FROM issues WHERE date(created_at) >= ? AND date(created_at) <= ?';
+    const issParams = [fromDate, toDate];
+    if (plantId) { issSql += ' AND plant_id = ?'; issParams.push(plantId); }
+    issSql += ' GROUP BY date(created_at)';
+
+    let resSql = 'SELECT date(resolved_at) as d, COUNT(*) as n FROM issues WHERE date(resolved_at) >= ? AND date(resolved_at) <= ?';
+    const resParams = [fromDate, toDate];
+    if (plantId) { resSql += ' AND plant_id = ?'; resParams.push(plantId); }
+    resSql += ' GROUP BY date(resolved_at)';
+
     let inspSql = `
-      SELECT COUNT(*) as insp_count 
+      SELECT date(si.inspected_at) as d, COUNT(*) as n
       FROM supervisor_inspections si
       JOIN toilets t ON si.toilet_id = t.id
-      WHERE date(si.inspected_at) = ?
+      WHERE date(si.inspected_at) >= ? AND date(si.inspected_at) <= ?
     `;
-    const inspParams = [dStr];
-    if (plantId) {
-      inspSql += ' AND t.plant_id = ?';
-      inspParams.push(plantId);
+    const inspParams = [fromDate, toDate];
+    if (plantId) { inspSql += ' AND t.plant_id = ?'; inspParams.push(plantId); }
+    inspSql += ' GROUP BY date(si.inspected_at)';
+
+    const [issuesByDay, resolvedByDay, inspByDay] = await Promise.all([
+      countsByDay(issSql, issParams),
+      countsByDay(resSql, resParams),
+      countsByDay(inspSql, inspParams)
+    ]);
+
+    for (const { dStr, displayDate } of days) {
+      const comp = compByDay.get(dStr) || { expected: 0, completed: 0, pending: 0, compliancePercentage: 100 };
+      results.push({
+        date: dStr,
+        displayDate,
+        expected: comp.expected,
+        completed: comp.completed,
+        pending: comp.pending,
+        missed: comp.pending,
+        compliancePercentage: comp.compliancePercentage,
+        issues: issuesByDay.get(dStr) || 0,
+        resolved: resolvedByDay.get(dStr) || 0,
+        inspections: inspByDay.get(dStr) || 0
+      });
     }
-    const inspRow = db.get(inspSql, inspParams);
-
-    results.push({
-      date: dStr,
-      displayDate: curr.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
-      expected: comp.expected,
-      completed: comp.completed,
-      pending: comp.pending,
-      missed: comp.missed,
-      compliancePercentage: comp.compliancePercentage,
-      issues: issRow.issues_count || 0,
-      resolved: resRow.resolved_count || 0,
-      inspections: inspRow.insp_count || 0
-    });
-
-    curr.setDate(curr.getDate() + 1);
   }
 
   // Reverse so newest date is first
@@ -73,8 +91,12 @@ router.get('/day-wise', authenticate, (req, res) => {
 });
 
 // 2. Comprehensive Filterable Reports
-router.get('/data', authenticate, (req, res) => {
-  const { reportType = 'daily_cleaning', plantId, date, month, toiletId, agentId, supervisorId, status } = req.query;
+router.get('/data', authenticate, async (req, res) => {
+  const { reportType = 'daily_cleaning', date, month, status } = req.query;
+  const plantId = numericId(req.query.plantId);
+  const toiletId = numericId(req.query.toiletId);
+  const agentId = numericId(req.query.agentId);
+  const supervisorId = numericId(req.query.supervisorId);
 
   let records = [];
 
@@ -99,7 +121,7 @@ router.get('/data', authenticate, (req, res) => {
       if (status) { query += ' AND cs.status = ?'; params.push(status); }
 
       query += ' ORDER BY cs.date DESC, cs.submit_time DESC';
-      records = db.all(query, params);
+      records = await db.all(query, params);
       break;
     }
 
@@ -117,8 +139,8 @@ router.get('/data', authenticate, (req, res) => {
       `;
       const params = [];
       if (plantId) { query += ' AND t.plant_id = ?'; params.push(plantId); }
-      query += ' GROUP BY t.id ORDER BY avg_score DESC, t.code ASC';
-      records = db.all(query, params);
+      query += ' GROUP BY t.id, p.name, a.name ORDER BY avg_score DESC NULLS LAST, t.code ASC';
+      records = await db.all(query, params);
       break;
     }
 
@@ -135,8 +157,8 @@ router.get('/data', authenticate, (req, res) => {
       `;
       const params = [];
       if (plantId) { query += ' AND u.plant_id = ?'; params.push(plantId); }
-      query += ' GROUP BY u.id ORDER BY sessions_completed DESC';
-      records = db.all(query, params);
+      query += ' GROUP BY u.id, p.name ORDER BY sessions_completed DESC';
+      records = await db.all(query, params);
       break;
     }
 
@@ -155,7 +177,7 @@ router.get('/data', authenticate, (req, res) => {
       if (plantId) { query += ' AND t.plant_id = ?'; params.push(plantId); }
       if (supervisorId) { query += ' AND si.supervisor_id = ?'; params.push(supervisorId); }
       query += ' ORDER BY si.inspected_at DESC';
-      records = db.all(query, params);
+      records = await db.all(query, params);
       break;
     }
 
@@ -175,13 +197,13 @@ router.get('/data', authenticate, (req, res) => {
       if (plantId) { query += ' AND i.plant_id = ?'; params.push(plantId); }
       if (status) { query += ' AND i.status = ?'; params.push(status); }
       query += ' ORDER BY i.created_at DESC';
-      records = db.all(query, params);
+      records = await db.all(query, params);
       break;
     }
 
     case 'missed_cleaning': {
       const targetDate = date || new Date().toISOString().slice(0, 10);
-      const comp = calculatePlantCompliance(plantId ? Number(plantId) : null, targetDate);
+      const comp = await calculatePlantCompliance(plantId, targetDate);
       records = comp.pendingToilets.map(t => ({
         date: targetDate,
         toilet_code: t.code,
@@ -200,8 +222,9 @@ router.get('/data', authenticate, (req, res) => {
 });
 
 // 3. Export to CSV format
-router.get('/export-csv', authenticate, (req, res) => {
-  const { reportType = 'daily_cleaning', plantId, date } = req.query;
+router.get('/export-csv', authenticate, async (req, res) => {
+  const { reportType = 'daily_cleaning', date } = req.query;
+  const plantId = numericId(req.query.plantId);
 
   let query = `
     SELECT cs.session_code, cs.date, cs.start_time, cs.submit_time, cs.checklist_score, cs.status,
@@ -217,7 +240,7 @@ router.get('/export-csv', authenticate, (req, res) => {
   if (plantId) { query += ' AND t.plant_id = ?'; params.push(plantId); }
   query += ' ORDER BY cs.date DESC';
 
-  const rows = db.all(query, params);
+  const rows = await db.all(query, params);
 
   let csvContent = 'Session Code,Date,Start Time,Submit Time,Score %,Status,Toilet Code,Plant,Agent Name\n';
   for (const r of rows) {

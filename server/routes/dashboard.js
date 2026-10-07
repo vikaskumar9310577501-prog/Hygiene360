@@ -2,10 +2,10 @@ const express = require('express');
 const router = express.Router();
 const db = require('../database');
 const { authenticate } = require('../middleware/auth');
-const { calculatePlantCompliance, getRecurringIssues, checkAndTriggerMissedCleaningAlerts } = require('../utils/complianceEngine');
+const { calculatePlantCompliance, calculateComplianceForDates, getRecurringIssues, checkAndTriggerMissedCleaningAlerts } = require('../utils/complianceEngine');
 
 // 1. Management Dashboard Overview KPIs & Charts
-router.get('/management', authenticate, (req, res) => {
+router.get('/management', authenticate, async (req, res) => {
   const { plantId, date } = req.query;
   const targetDate = date || new Date().toISOString().slice(0, 10);
 
@@ -19,16 +19,16 @@ router.get('/management', authenticate, (req, res) => {
     targetPlantId = req.user.plant_id;
   } else {
     // Default to first active plant if none specified
-    const firstPlant = db.get("SELECT id FROM plants WHERE code = 'BHIWADI' LIMIT 1") || db.get('SELECT id FROM plants LIMIT 1');
+    const firstPlant = (await db.get("SELECT id FROM plants WHERE code = 'BHIWADI' LIMIT 1")) || (await db.get('SELECT id FROM plants LIMIT 1'));
     targetPlantId = firstPlant ? firstPlant.id : null;
   }
 
   const plant = targetPlantId 
-    ? db.get('SELECT * FROM plants WHERE id = ?', [targetPlantId]) 
+    ? await db.get('SELECT * FROM plants WHERE id = ?', [targetPlantId]) 
     : { id: 'all', name: 'All Manufacturing Plants', code: 'ALL' };
 
   // 1. Compliance calculations using single source of truth engine
-  const compliance = calculatePlantCompliance(targetPlantId, targetDate);
+  const compliance = await calculatePlantCompliance(targetPlantId, targetDate);
 
   // 2. Consistent 7 Management KPIs (Toilet Cleaning + Compliance + Achievement)
   const totalToilets = compliance.expected;
@@ -54,13 +54,37 @@ router.get('/management', authenticate, (req, res) => {
     achievementPct
   };
 
-  // 3. Day-wise cleaning trend (past 7 days)
-  const dayWiseTrend = [];
+  const trendDays = [];
   for (let i = 6; i >= 0; i--) {
     const d = new Date();
     d.setDate(d.getDate() - i);
+    trendDays.push(d);
+  }
+  const trendMonths = [];
+  for (let m = 5; m >= 0; m--) {
+    const base = new Date();
+    base.setDate(1);
+    base.setMonth(base.getMonth() - m);
+    trendMonths.push(base);
+  }
+  const monthKey = (y, mo, day) => `${y}-${String(mo + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+  const firstSession = await db.get('SELECT MIN(date) as d FROM cleaning_sessions');
+  const goLive = firstSession?.d || new Date().toISOString().slice(0, 10);
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  const firstTrendDay = trendDays[0].toISOString().slice(0, 10);
+  const firstMonthDay = monthKey(trendMonths[0].getFullYear(), trendMonths[0].getMonth(), 1);
+  const monthFrom = goLive > firstMonthDay ? goLive : firstMonthDay;
+  const earliestDate = firstTrendDay < monthFrom ? firstTrendDay : monthFrom;
+  const complianceByDate = await calculateComplianceForDates(targetPlantId, earliestDate, todayStr);
+  const complianceOn = (dStr) => complianceByDate.get(dStr) || { expected: 0, completed: 0, pending: 0, compliancePercentage: 100 };
+
+  // 3. Day-wise cleaning trend (past 7 days)
+  const dayWiseTrend = [];
+  for (const d of trendDays) {
     const dStr = d.toISOString().slice(0, 10);
-    const comp = calculatePlantCompliance(targetPlantId, dStr);
+    const comp = complianceOn(dStr);
     dayWiseTrend.push({
       date: dStr,
       displayDate: d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }),
@@ -72,14 +96,8 @@ router.get('/management', authenticate, (req, res) => {
   }
 
   // 4. Month-wise cleaning trend (past 6 months)
-  const firstSession = db.get('SELECT MIN(date) as d FROM cleaning_sessions');
-  const goLive = firstSession?.d || new Date().toISOString().slice(0, 10);
-  const todayStr = new Date().toISOString().slice(0, 10);
   const monthWiseTrend = [];
-  for (let m = 5; m >= 0; m--) {
-    const base = new Date();
-    base.setDate(1);
-    base.setMonth(base.getMonth() - m);
+  for (const base of trendMonths) {
     const y = base.getFullYear();
     const mo = base.getMonth();
     const daysInMonth = new Date(y, mo + 1, 0).getDate();
@@ -87,9 +105,9 @@ router.get('/management', authenticate, (req, res) => {
     let completed = 0;
     let days = 0;
     for (let day = 1; day <= daysInMonth; day++) {
-      const dStr = `${y}-${String(mo + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const dStr = monthKey(y, mo, day);
       if (dStr < goLive || dStr > todayStr) continue;
-      const comp = calculatePlantCompliance(targetPlantId, dStr);
+      const comp = complianceOn(dStr);
       expected += comp.expected;
       completed += comp.completed;
       days++;
@@ -129,8 +147,8 @@ router.get('/management', authenticate, (req, res) => {
     toiletPerfParams.push(targetPlantId);
   }
   toiletPerfSql += ' ORDER BY t.code ASC';
-  const toiletPerformance = db.all(toiletPerfSql, toiletPerfParams);
-  const recurringIssues = getRecurringIssues(targetPlantId, 30, 2);
+  const toiletPerformance = await db.all(toiletPerfSql, toiletPerfParams);
+  const recurringIssues = await getRecurringIssues(targetPlantId, 30, 2);
 
   res.json({
     success: true,
@@ -146,7 +164,7 @@ router.get('/management', authenticate, (req, res) => {
 });
 
 // 2. Housekeeping Agent Dashboard
-router.get('/agent', authenticate, (req, res) => {
+router.get('/agent', authenticate, async (req, res) => {
   const userId = req.user.id;
   const todayStr = new Date().toISOString().slice(0, 10);
   const plantId = req.user.plant_id;
@@ -174,7 +192,7 @@ router.get('/agent', authenticate, (req, res) => {
   }
   toiletSql += ' ORDER BY t.code ASC';
 
-  const toilets = db.all(toiletSql, params);
+  const toilets = await db.all(toiletSql, params);
 
   const targetCount = toilets.length;
   const completedCount = toilets.filter(t => t.status === 'COMPLETED').length;
@@ -182,7 +200,7 @@ router.get('/agent', authenticate, (req, res) => {
   const progressPct = targetCount > 0 ? Number(((completedCount / targetCount) * 100).toFixed(1)) : 100;
 
   // Agent's assigned issues
-  const assignedIssues = db.all(`
+  const assignedIssues = await db.all(`
     SELECT i.*, t.code as toilet_code, t.name as toilet_name
     FROM issues i
     JOIN toilets t ON i.toilet_id = t.id
@@ -191,7 +209,7 @@ router.get('/agent', authenticate, (req, res) => {
   `, [userId]);
 
   // Rejected submissions if any
-  const rejectedSessions = db.all(`
+  const rejectedSessions = await db.all(`
     SELECT cs.*, t.code as toilet_code, t.name as toilet_name
     FROM cleaning_sessions cs
     JOIN toilets t ON cs.toilet_id = t.id
@@ -216,7 +234,7 @@ router.get('/agent', authenticate, (req, res) => {
 });
 
 // 3. Supervisor Dashboard
-router.get('/supervisor', authenticate, (req, res) => {
+router.get('/supervisor', authenticate, async (req, res) => {
   const todayStr = new Date().toISOString().slice(0, 10);
   const plantId = req.user.plant_id;
 
@@ -233,7 +251,7 @@ router.get('/supervisor', authenticate, (req, res) => {
     inspectSql += ' AND t.plant_id = ?';
     inspectParams.push(plantId);
   }
-  const inspections = db.all(inspectSql, inspectParams);
+  const inspections = await db.all(inspectSql, inspectParams);
 
   // Issues found today and active
   let issueSql = `
@@ -249,17 +267,17 @@ router.get('/supervisor', authenticate, (req, res) => {
     issueParams.push(plantId);
   }
   issueSql += ' ORDER BY i.created_at DESC LIMIT 50';
-  const allIssues = db.all(issueSql, issueParams);
+  const allIssues = await db.all(issueSql, issueParams);
 
   const openIssues = allIssues.filter(i => ['OPEN', 'ASSIGNED', 'IN_PROGRESS'].includes(i.status));
   const resolvedIssues = allIssues.filter(i => i.status === 'RESOLVED'); // Waiting for verification
   const closedIssues = allIssues.filter(i => ['VERIFIED', 'CLOSED'].includes(i.status));
 
   // Compliance summary
-  const compliance = calculatePlantCompliance(plantId, todayStr);
+  const compliance = await calculatePlantCompliance(plantId, todayStr);
 
   // Recurring issues
-  const recurring = getRecurringIssues(plantId, 30, 2);
+  const recurring = await getRecurringIssues(plantId, 30, 2);
 
   res.json({
     success: true,
@@ -280,11 +298,11 @@ router.get('/supervisor', authenticate, (req, res) => {
 });
 
 // 4. Toilet 360 Drilldown Detail Modal
-router.get('/toilet/:id', authenticate, (req, res) => {
+router.get('/toilet/:id', authenticate, async (req, res) => {
   const toiletId = req.params.id;
   const todayStr = new Date().toISOString().slice(0, 10);
 
-  const toilet = db.get(`
+  const toilet = await db.get(`
     SELECT t.*, p.name as plant_name, p.code as plant_code,
            b.name as building_name, f.name as floor_name, a.name as area_name
     FROM toilets t
@@ -300,7 +318,7 @@ router.get('/toilet/:id', authenticate, (req, res) => {
   }
 
   // Latest cleaning session
-  const lastCleaning = db.get(`
+  const lastCleaning = await db.get(`
     SELECT cs.*, u.name as agent_name, u.employee_id as agent_emp_id
     FROM cleaning_sessions cs
     JOIN users u ON cs.user_id = u.id
@@ -311,12 +329,12 @@ router.get('/toilet/:id', authenticate, (req, res) => {
   let evidencePhotos = [];
   let checklistResponses = [];
   if (lastCleaning) {
-    evidencePhotos = db.all('SELECT * FROM evidence_photos WHERE session_id = ?', [lastCleaning.id]);
-    checklistResponses = db.all('SELECT * FROM checklist_responses WHERE session_id = ?', [lastCleaning.id]);
+    evidencePhotos = await db.all('SELECT * FROM evidence_photos WHERE session_id = ?', [lastCleaning.id]);
+    checklistResponses = await db.all('SELECT * FROM checklist_responses WHERE session_id = ?', [lastCleaning.id]);
   }
 
   // Last supervisor inspection
-  const lastInspection = db.get(`
+  const lastInspection = await db.get(`
     SELECT si.*, u.name as supervisor_name
     FROM supervisor_inspections si
     JOIN users u ON si.supervisor_id = u.id
@@ -325,7 +343,7 @@ router.get('/toilet/:id', authenticate, (req, res) => {
   `, [toiletId]);
 
   // Open issues
-  const openIssues = db.all(`
+  const openIssues = await db.all(`
     SELECT i.*, u.name as supervisor_name, a.name as agent_name
     FROM issues i
     JOIN users u ON i.supervisor_id = u.id
@@ -388,9 +406,9 @@ router.get('/toilet/:id', authenticate, (req, res) => {
 });
 
 // 5. Trigger Missed Cleaning Checkpoint Evaluation
-router.post('/trigger-checkpoint', authenticate, (req, res) => {
+router.post('/trigger-checkpoint', authenticate, async (req, res) => {
   const { plantId } = req.body;
-  const alerts = checkAndTriggerMissedCleaningAlerts(plantId);
+  const alerts = await checkAndTriggerMissedCleaningAlerts(plantId);
   res.json({
     success: true,
     message: 'Checkpoint compliance evaluation executed.',

@@ -1,4 +1,4 @@
-const db = require('./database');
+const db = require('./db/sqlite').sync;
 
 const toilets = db.all('SELECT * FROM toilets WHERE plant_id = 1');
 const shift = db.get('SELECT id FROM shifts LIMIT 1');

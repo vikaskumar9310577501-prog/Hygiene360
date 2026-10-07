@@ -8,7 +8,10 @@ let tesseractWorker = null;
 async function getWorker() {
   if (!tesseractWorker) {
     try {
-      tesseractWorker = await createWorker('eng');
+      // Serverless file systems are read-only outside the temp dir
+      tesseractWorker = process.env.VERCEL
+        ? await createWorker('eng', 1, { cachePath: require('os').tmpdir() })
+        : await createWorker('eng');
     } catch (e) {
       console.warn('Tesseract worker init skipped, using pattern-based date verification:', e.message);
       return null;
@@ -52,7 +55,7 @@ function getTodayFormatted() {
 /**
  * Check if the image hash was previously submitted to prevent duplicate/reused evidence
  */
-function checkDuplicateEvidence(imageHash, currentSessionId = null, currentPhotoType = null) {
+async function checkDuplicateEvidence(imageHash, currentSessionId = null, currentPhotoType = null) {
   if (!imageHash) return { isDuplicate: false };
 
   let query = 'SELECT ep.id, ep.session_id, ep.photo_type, ep.captured_at, cs.session_code FROM evidence_photos ep LEFT JOIN cleaning_sessions cs ON ep.session_id = cs.id WHERE ep.image_hash = ? AND ep.is_rejected = 0';
@@ -67,7 +70,7 @@ function checkDuplicateEvidence(imageHash, currentSessionId = null, currentPhoto
     params.push(currentSessionId);
   }
 
-  const existing = db.get(query, params);
+  const existing = await db.get(query, params);
   if (existing) {
     return {
       isDuplicate: true,

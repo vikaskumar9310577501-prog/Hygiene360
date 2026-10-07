@@ -3,30 +3,31 @@ const db = require('../database');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'hygiene360-enterprise-production-secret-key-99281';
 
-function authenticate(req, res, next) {
+async function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, error: 'Unauthorized: Authentication token required' });
   }
 
   const token = authHeader.split(' ')[1];
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    // Fetch latest user details from DB to ensure user is active and has up-to-date role
-    const user = db.get(
-      'SELECT id, employee_id, name, email, role, plant_id, phone, is_active FROM users WHERE id = ?',
-      [decoded.id]
-    );
-
-    if (!user || !user.is_active) {
-      return res.status(401).json({ success: false, error: 'User account is inactive or not found' });
-    }
-
-    req.user = user;
-    next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (err) {
     return res.status(401).json({ success: false, error: 'Invalid or expired session token' });
   }
+  // Fetch latest user details from DB to ensure user is active and has up-to-date role
+  const user = await db.get(
+    'SELECT id, employee_id, name, email, role, plant_id, phone, is_active FROM users WHERE id = ?',
+    [decoded.id]
+  );
+
+  if (!user || !user.is_active) {
+    return res.status(401).json({ success: false, error: 'User account is inactive or not found' });
+  }
+
+  req.user = user;
+  next();
 }
 
 // Role Authorization middleware

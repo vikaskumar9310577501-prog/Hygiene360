@@ -1,9 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const db = require('../database');
+const storage = require('../utils/storage');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { auditLogFromReq } = require('../middleware/audit');
 const { applyWatermark } = require('../utils/watermark');
@@ -14,9 +13,6 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, fieldSize: 15 * 1024 * 1024 }
 });
-
-const EVIDENCE_DIR = path.join(__dirname, '..', 'uploads', 'evidence');
-
 const ACTIVE_STATUSES = ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'REOPENED'];
 const VERIFIER_ROLES = ['SUPERVISOR', 'SUPER_ADMIN', 'PLANT_ADMIN', 'IT_ADMIN'];
 const isHousekeepingRole = role => role === 'HOUSEKEEPING_AGENT' || role === 'HOUSEKEEPING';
@@ -55,21 +51,27 @@ async function saveIssuePhoto(base64OrBuffer, ctx, { photoType, reference, user,
   const watermarked = await applyWatermark(buffer, location.watermarkMeta(ctx, { photoType, reference, user }));
   const safeCode = String((ctx && (ctx.toilet_uid || ctx.code)) || 'FACILITY').replace(/[^A-Za-z0-9-]/g, '');
   const fileName = `H360_${filePrefix}_${safeCode}_${Date.now()}.jpg`;
-  fs.writeFileSync(path.join(EVIDENCE_DIR, fileName), watermarked.buffer);
-  return `/uploads/evidence/${fileName}`;
+  return storage.save(`/uploads/evidence/${fileName}`, watermarked.buffer, 'image/jpeg');
 }
 
 // New employee complaints go to the plant admins (and the toilet supervisor) to verify and assign
-function notifyComplaintVerifiers(plantId, supervisorId, title, message, meta) {
-  const ids = new Set(slotUtils.getPlantAdminRecipients(plantId).map(u => u.id));
+async function notifyComplaintVerifiers(plantId, supervisorId, title, message, meta) {
+  const ids = new Set((await slotUtils.getPlantAdminRecipients(plantId)).map(u => u.id));
   if (supervisorId) ids.add(supervisorId);
-  ids.forEach(id => slotUtils.notify(id, title, message, 'COMPLAINT_NEW', meta));
+  for (const id of ids) {
+    await slotUtils.notify(id, title, message, 'COMPLAINT_NEW', meta);
+  }
 }
 
+const toId = v => {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
+
 // A defect reported on a toilet a housekeeper marked clean today flags that cleaning for review
-function flagCleaningDiscrepancy(toilet, reporterName, reporterEmpId, defectText) {
+async function flagCleaningDiscrepancy(toilet, reporterName, reporterEmpId, defectText) {
   const todayStr = new Date().toISOString().slice(0, 10);
-  const todaySession = db.get(`
+  const todaySession = await db.get(`
     SELECT cs.*, u.name as agent_name, u.employee_id as agent_emp_id
     FROM cleaning_sessions cs
     JOIN users u ON cs.user_id = u.id
@@ -80,27 +82,31 @@ function flagCleaningDiscrepancy(toilet, reporterName, reporterEmpId, defectText
 
   const timeStr = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
   const reason = `Discrepancy Detected: Employee ${reporterName} (Emp ID: ${reporterEmpId}) reported '${defectText}' at ${timeStr}, but Housekeeper ${todaySession.agent_name} (${todaySession.agent_emp_id}) had marked this facility clean today in Session ${todaySession.session_code}.`;
-  db.run('UPDATE cleaning_sessions SET is_fake_audit_flagged = 1, fake_flag_reason = ? WHERE id = ?', [reason, todaySession.id]);
+  await db.run('UPDATE cleaning_sessions SET is_fake_audit_flagged = 1, fake_flag_reason = ? WHERE id = ?', [reason, todaySession.id]);
 
-  const adminUsers = db.all(`
+  const adminUsers = await db.all(`
     SELECT id FROM users WHERE role IN ('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMIN') AND (plant_id = ? OR plant_id IS NULL)
   `, [toilet.plant_id]);
-  adminUsers.forEach(adm => slotUtils.notify(adm.id, 'Cleaning Discrepancy Detected',
-    `Employee ${reporterName} (${reporterEmpId}) reported "${defectText}" for ${toilet.code} (${toilet.name}). Housekeeper ${todaySession.agent_name} (${todaySession.agent_emp_id}) marked it clean today.`,
-    'ALERT', { toilet_id: toilet.id, toilet_code: toilet.code, session_code: todaySession.session_code }));
+  for (const adm of adminUsers) {
+    await slotUtils.notify(adm.id, 'Cleaning Discrepancy Detected',
+      `Employee ${reporterName} (${reporterEmpId}) reported "${defectText}" for ${toilet.code} (${toilet.name}). Housekeeper ${todaySession.agent_name} (${todaySession.agent_emp_id}) marked it clean today.`,
+      'ALERT', { toilet_id: toilet.id, toilet_code: toilet.code, session_code: todaySession.session_code });
+  }
 
   return { session: todaySession, reason };
 }
 
 // Get Issue Categories
-router.get('/categories', (req, res) => {
-  const categories = db.all('SELECT * FROM issue_categories WHERE is_active = 1 ORDER BY name ASC');
+router.get('/categories', async (req, res) => {
+  const categories = await db.all('SELECT * FROM issue_categories WHERE is_active = 1 ORDER BY name ASC');
   res.json({ success: true, categories });
 });
 
 // List Issues with filters
-router.get('/', authenticate, (req, res) => {
-  const { status, priority, toiletId, plantId, category } = req.query;
+router.get('/', authenticate, async (req, res) => {
+  const { status, priority, category } = req.query;
+  const toiletId = toId(req.query.toiletId);
+  const plantId = toId(req.query.plantId);
 
   let query = `
     SELECT i.*, t.code as toilet_code, t.name as toilet_name, t.toilet_uid,
@@ -155,14 +161,15 @@ router.get('/', authenticate, (req, res) => {
 
   query += " ORDER BY CASE i.status WHEN 'REOPENED' THEN 0 WHEN 'OPEN' THEN 1 WHEN 'ASSIGNED' THEN 2 WHEN 'IN_PROGRESS' THEN 3 WHEN 'RESOLVED' THEN 4 WHEN 'VERIFIED' THEN 5 ELSE 6 END, i.created_at DESC";
 
-  const issues = db.all(query, params);
+  const issues = await db.all(query, params);
   res.json({ success: true, issues });
 });
 
 // Employee Complaints & Reports List & KPI Dashboard
-router.get('/complaints-report', authenticate, (req, res) => {
+router.get('/complaints-report', authenticate, async (req, res) => {
   try {
-    const { type, status, fakeOnly, search, plantId } = req.query;
+    const { type, status, fakeOnly, search } = req.query;
+    const plantId = toId(req.query.plantId);
 
     let query = `
       SELECT i.*, 
@@ -207,7 +214,7 @@ router.get('/complaints-report', authenticate, (req, res) => {
 
     query += ' ORDER BY i.is_fake_audit_flagged DESC, i.created_at DESC';
 
-    const complaints = db.all(query, params);
+    const complaints = await db.all(query, params);
 
     // Compute KPI statistics
     let plantFilterSql = '';
@@ -217,18 +224,18 @@ router.get('/complaints-report', authenticate, (req, res) => {
       plantParams = [req.user.plant_id];
     }
 
-    const countIssues = (where) => db.get(`SELECT COUNT(*) as c FROM issues WHERE ${where} ${plantFilterSql}`, plantParams)?.c || 0;
+    const countIssues = async (where) => (await db.get(`SELECT COUNT(*) as c FROM issues WHERE ${where} ${plantFilterSql}`, plantParams))?.c || 0;
     const employeeComplaint = "complaint_type IN ('HOUSEKEEPING', 'DRINKING_WATER') AND reported_by_emp_id IS NOT NULL";
     const stats = {
-      total: countIssues(employeeComplaint),
-      housekeeping: countIssues("complaint_type = 'HOUSEKEEPING'"),
-      drinkingWater: countIssues("complaint_type = 'DRINKING_WATER'"),
-      cleaningReview: countIssues("complaint_type = 'CLEANING_AUDIT'"),
-      fakeAuditFlagged: countIssues('is_fake_audit_flagged = 1'),
-      awaitingVerification: countIssues(`${employeeComplaint} AND status = 'OPEN' AND assigned_agent_id IS NULL`),
-      pending: countIssues(`${employeeComplaint} AND status IN ('OPEN', 'ASSIGNED', 'IN_PROGRESS', 'REOPENED')`),
-      resolved: countIssues(`${employeeComplaint} AND status IN ('RESOLVED', 'CLOSED', 'VERIFIED')`),
-      open: countIssues("status = 'OPEN'")
+      total: await countIssues(employeeComplaint),
+      housekeeping: await countIssues("complaint_type = 'HOUSEKEEPING'"),
+      drinkingWater: await countIssues("complaint_type = 'DRINKING_WATER'"),
+      cleaningReview: await countIssues("complaint_type = 'CLEANING_AUDIT'"),
+      fakeAuditFlagged: await countIssues('is_fake_audit_flagged = 1'),
+      awaitingVerification: await countIssues(`${employeeComplaint} AND status = 'OPEN' AND assigned_agent_id IS NULL`),
+      pending: await countIssues(`${employeeComplaint} AND status IN ('OPEN', 'ASSIGNED', 'IN_PROGRESS', 'REOPENED')`),
+      resolved: await countIssues(`${employeeComplaint} AND status IN ('RESOLVED', 'CLOSED', 'VERIFIED')`),
+      open: await countIssues("status = 'OPEN'")
     };
 
     res.json({
@@ -270,15 +277,15 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
 
     // Lookup toilet / facility
     let toilet = null;
-    if (toiletId) {
-      toilet = db.get(`
+    if (toId(toiletId)) {
+      toilet = await db.get(`
         SELECT t.*, p.name as plant_name 
         FROM toilets t 
         JOIN plants p ON t.plant_id = p.id 
         WHERE t.id = ?
-      `, [toiletId]);
+      `, [toId(toiletId)]);
     } else if (qrToken) {
-      toilet = db.get(`
+      toilet = await db.get(`
         SELECT t.*, p.name as plant_name 
         FROM toilets t 
         JOIN plants p ON t.plant_id = p.id 
@@ -290,7 +297,7 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
       return res.status(400).json({ success: false, error: 'Facility or toilet could not be determined.' });
     }
 
-    const supervisorId = location.resolveSupervisorId(location.getToiletContext(toilet.id));
+    const supervisorId = await location.resolveSupervisorId(await location.getToiletContext(toilet.id));
 
     // Check today's housekeeping cleaning session for ANTI-FRAUD detection
     let isFakeAuditFlagged = 0;
@@ -301,7 +308,7 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
     let assignedAgentId = null;
 
     const todayStr = new Date().toISOString().slice(0, 10);
-    const todaySession = db.get(`
+    const todaySession = await db.get(`
       SELECT cs.*, u.name as agent_name, u.employee_id as agent_emp_id
       FROM cleaning_sessions cs
       JOIN users u ON cs.user_id = u.id
@@ -321,14 +328,14 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
       flaggedReason = `Discrepancy Detected: Employee ${employeeName} (Emp ID: ${employeeId}) reported dirty '${checklistItemLabel || category}' at ${timeStr}, but Housekeeper ${todaySession.agent_name} (${todaySession.agent_emp_id}) had marked this facility clean today in Session ${todaySession.session_code}.`;
 
       // Flag the cleaning session in the database
-      db.run(`
+      await db.run(`
         UPDATE cleaning_sessions 
         SET is_fake_audit_flagged = 1, fake_flag_reason = ? 
         WHERE id = ?
       `, [flaggedReason, todaySession.id]);
 
       // TRIGGER IN-APP NOTIFICATIONS FOR ALL ADMINS
-      const adminUsers = db.all(`
+      const adminUsers = await db.all(`
         SELECT id FROM users 
         WHERE role IN ('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMIN') 
           AND (plant_id = ? OR plant_id IS NULL)
@@ -337,8 +344,8 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
       const notifTitle = '🚨 FAKE CLEANING AUDIT DETECTED';
       const notifMsg = `Audit Discrepancy: Employee ${employeeName} (${employeeId}) reported dirty "${checklistItemLabel || category}" for ${toilet.code} (${toilet.name})! Housekeeper ${todaySession.agent_name} (${todaySession.agent_emp_id}) marked it clean today.`;
 
-      adminUsers.forEach(adm => {
-        db.run(`
+      for (const adm of adminUsers) {
+        await db.run(`
           INSERT INTO notifications (user_id, title, message, type, metadata_json)
           VALUES (?, ?, ?, 'ALERT', ?)
         `, [
@@ -356,13 +363,13 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
             reported_by_emp_id: employeeId
           })
         ]);
-      });
+      }
     }
 
     // Process photo if provided
     let photoPath = null;
     if (req.file || req.body.imageBase64) {
-      photoPath = await saveIssuePhoto(req.file ? req.file.buffer : req.body.imageBase64, location.getToiletContext(toilet.id), {
+      photoPath = await saveIssuePhoto(req.file ? req.file.buffer : req.body.imageBase64, await location.getToiletContext(toilet.id), {
         photoType: complaintType === 'DRINKING_WATER' ? 'DRINKING WATER DEFECT' : 'HOUSEKEEPING DEFECT',
         reference: 'REPORT',
         user: { name: employeeName, employee_id: employeeId },
@@ -370,9 +377,9 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
       });
     }
 
-    const ticketNo = location.nextTicketNo('H360-TKT');
+    const ticketNo = await location.nextTicketNo('H360-TKT');
 
-    const insertRes = db.run(`
+    const insertRes = await db.run(`
       INSERT INTO issues (
         ticket_no, plant_id, toilet_id, area_id, category, description,
         supervisor_id, assigned_agent_id, evidence_photo_path, priority, status,
@@ -405,19 +412,19 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
       flaggedAgentEmpId,
       flaggedSessionCode,
       flaggedReason,
-      location.targetFromNow()
+      await location.targetFromNow()
     ]);
 
     const issueId = insertRes.lastInsertRowid;
 
     // Track in issue updates
-    db.run(`
+    await db.run(`
       INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path)
       VALUES (?, ?, NULL, 'OPEN', ?, ?)
     `, [issueId, supervisorId, `Complaint submitted by Employee ${employeeName} (${employeeId})${isFakeAuditFlagged ? ' - 🚨 FAKE AUDIT FLAGGED' : ''}`, photoPath]);
 
     try {
-      notifyComplaintVerifiers(toilet.plant_id, supervisorId, `New Complaint: ${checklistItemLabel || category}`,
+      await notifyComplaintVerifiers(toilet.plant_id, supervisorId, `New Complaint: ${checklistItemLabel || category}`,
         `${ticketNo} at ${toilet.code} (${toilet.name}) reported by ${employeeName} (${employeeId}). Verify it and assign a housekeeper.`, {
           issue_id: Number(issueId),
           ticket_no: ticketNo,
@@ -450,8 +457,8 @@ router.post('/employee-complaint', upload.single('photo'), async (req, res) => {
 });
 
 // Evaluation points for a toilet (Cleanliness, Consumables, Equipment)
-router.get('/evaluation-points', authenticate, (req, res) => {
-  const toilet = req.query.toiletId ? db.get('SELECT id, gender FROM toilets WHERE id = ?', [req.query.toiletId]) : null;
+router.get('/evaluation-points', authenticate, async (req, res) => {
+  const toilet = toId(req.query.toiletId) ? await db.get('SELECT id, gender FROM toilets WHERE id = ?', [toId(req.query.toiletId)]) : null;
   res.json({ success: true, points: evaluationPointsFor(toilet) });
 });
 
@@ -459,7 +466,7 @@ router.get('/evaluation-points', authenticate, (req, res) => {
 router.post('/employee-evaluation', authenticate, async (req, res) => {
   try {
     const { toiletId, responses = [], remarks = '', imageBase64 } = req.body;
-    const ctx = location.getToiletContext(Number(toiletId));
+    const ctx = toId(toiletId) ? await location.getToiletContext(toId(toiletId)) : null;
     if (!ctx) return res.status(400).json({ success: false, error: 'Toilet not found. Please scan the toilet QR again.' });
 
     const points = evaluationPointsFor(ctx);
@@ -490,7 +497,7 @@ router.post('/employee-evaluation', authenticate, async (req, res) => {
       key: p.key, category: p.category, label: p.label, status: byKey.get(p.key).status,
       note: byKey.get(p.key).note ? String(byKey.get(p.key).note).slice(0, 300) : null
     }));
-    const evalRes = db.run(`
+    const evalRes = await db.run(`
       INSERT INTO employee_evaluations (toilet_id, plant_id, user_id, evaluator_name, evaluator_emp_id, responses_json,
                                         total_points, not_ok_count, remarks, photo_path)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -498,7 +505,7 @@ router.post('/employee-evaluation', authenticate, async (req, res) => {
         points.length, notOk.length, String(remarks || '').slice(0, 1000), photoPath]);
     const evaluationId = Number(evalRes.lastInsertRowid);
 
-    auditLogFromReq(req, 'EMPLOYEE_EVALUATION_SUBMITTED', 'TOILET', ctx.toilet_uid || ctx.code, {
+    await auditLogFromReq(req, 'EMPLOYEE_EVALUATION_SUBMITTED', 'TOILET', ctx.toilet_uid || ctx.code, {
       evaluation_id: evaluationId, not_ok: notOk.map(p => p.label)
     });
 
@@ -512,14 +519,14 @@ router.post('/employee-evaluation', authenticate, async (req, res) => {
       .map(r => `${r.label}${r.note ? `: ${r.note}` : ''}`)
       .join('; ') + (remarks ? ` | Remarks: ${remarks}` : '');
 
-    const discrepancy = flagCleaningDiscrepancy(ctx, reporterName, reporterEmpId, labels.join(', '));
-    const supervisorId = location.resolveSupervisorId(ctx);
+    const discrepancy = await flagCleaningDiscrepancy(ctx, reporterName, reporterEmpId, labels.join(', '));
+    const supervisorId = await location.resolveSupervisorId(ctx);
     // Complaints wait for the admin to verify and assign a housekeeper
     const responsibleId = null;
-    const targetAt = location.targetFromNow();
-    const ticketNo = location.nextTicketNo('H360-TKT');
+    const targetAt = await location.targetFromNow();
+    const ticketNo = await location.nextTicketNo('H360-TKT');
 
-    const issueRes = db.run(`
+    const issueRes = await db.run(`
       INSERT INTO issues (ticket_no, plant_id, toilet_id, area_id, category, description, supervisor_id, assigned_agent_id,
                           evidence_photo_path, priority, status, complaint_type, reported_by_name, reported_by_emp_id,
                           reported_by_email, reported_by_phone, checklist_item_label, is_fake_audit_flagged, flagged_agent_name,
@@ -537,8 +544,8 @@ router.post('/employee-evaluation', authenticate, async (req, res) => {
       targetAt, evaluationId
     ]);
     const issueId = Number(issueRes.lastInsertRowid);
-    db.run('UPDATE employee_evaluations SET issue_id = ? WHERE id = ?', [issueId, evaluationId]);
-    db.run(`
+    await db.run('UPDATE employee_evaluations SET issue_id = ? WHERE id = ?', [issueId, evaluationId]);
+    await db.run(`
       INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path)
       VALUES (?, ?, NULL, ?, ?, ?)
     `, [issueId, req.user.id, responsibleId ? 'ASSIGNED' : 'OPEN', `Employee evaluation by ${reporterName} (${reporterEmpId}): NOT OK - ${labels.join(', ')}`, photoPath]);
@@ -548,7 +555,7 @@ router.post('/employee-evaluation', authenticate, async (req, res) => {
       plant_id: ctx.plant_id, category: labels.join(', '), defect: labels.join(', '), reported_by_name: reporterName,
       reported_by_emp_id: reporterEmpId, complaint_type: 'HOUSEKEEPING', target_at: targetAt, created_at: new Date().toISOString()
     };
-    notifyComplaintVerifiers(ctx.plant_id, supervisorId, `New Complaint: ${labels.join(', ')}`,
+    await notifyComplaintVerifiers(ctx.plant_id, supervisorId, `New Complaint: ${labels.join(', ')}`,
       `${ticketNo} at ${ctx.toilet_uid || ctx.code} reported by ${reporterName}. Verify it and assign a housekeeper.`, meta);
 
     res.json({
@@ -569,18 +576,18 @@ router.post('/employee-evaluation', authenticate, async (req, res) => {
 });
 
 // Recent employee evaluations (admins, management, supervisors)
-router.get('/evaluations', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT', 'SUPERVISOR'), (req, res) => {
+router.get('/evaluations', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN', 'PLANT_ADMIN', 'MANAGEMENT', 'SUPERVISOR'), async (req, res) => {
   const params = [];
   let where = '1=1';
-  if (req.query.toiletId) {
+  if (toId(req.query.toiletId)) {
     where += ' AND ev.toilet_id = ?';
-    params.push(Number(req.query.toiletId));
+    params.push(toId(req.query.toiletId));
   }
   if (req.user.plant_id && !['SUPER_ADMIN', 'IT_ADMIN', 'MANAGEMENT'].includes(req.user.role)) {
     where += ' AND ev.plant_id = ?';
     params.push(req.user.plant_id);
   }
-  const list = db.all(`
+  const list = await db.all(`
     SELECT ev.*, t.code as toilet_code, t.name as toilet_name, t.toilet_uid, p.name as plant_name, i.ticket_no, i.status as issue_status
     FROM employee_evaluations ev
     JOIN toilets t ON ev.toilet_id = t.id
@@ -595,9 +602,9 @@ router.get('/evaluations', authenticate, requireRole('SUPER_ADMIN', 'IT_ADMIN', 
 
 // Change responsible person and target time of an issue
 // Housekeeping staff an issue can be assigned to
-router.get('/responsible-people', authenticate, requireRole(...VERIFIER_ROLES), (req, res) => {
-  const plantId = req.query.plantId || req.user.plant_id;
-  const people = db.all(`
+router.get('/responsible-people', authenticate, requireRole(...VERIFIER_ROLES), async (req, res) => {
+  const plantId = toId(req.query.plantId) || req.user.plant_id;
+  const people = await db.all(`
     SELECT id, name, employee_id, role FROM users
     WHERE is_active = 1 AND role IN ('HOUSEKEEPING_AGENT', 'HOUSEKEEPING') ${plantId ? 'AND plant_id = ?' : ''}
     ORDER BY name
@@ -605,8 +612,8 @@ router.get('/responsible-people', authenticate, requireRole(...VERIFIER_ROLES), 
   res.json({ success: true, people });
 });
 
-router.patch('/:id/assign', authenticate, requireRole(...VERIFIER_ROLES), (req, res) => {
-  const issue = db.get('SELECT * FROM issues WHERE id = ?', [req.params.id]);
+router.patch('/:id/assign', authenticate, requireRole(...VERIFIER_ROLES), async (req, res) => {
+  const issue = toId(req.params.id) ? await db.get('SELECT * FROM issues WHERE id = ?', [toId(req.params.id)]) : null;
   if (!issue) return res.status(404).json({ success: false, error: 'Issue not found' });
   if (!ACTIVE_STATUSES.includes(issue.status)) {
     return res.status(400).json({ success: false, error: 'Only open issues can be reassigned.' });
@@ -615,7 +622,7 @@ router.patch('/:id/assign', authenticate, requireRole(...VERIFIER_ROLES), (req, 
   const { assignedAgentId, targetAt } = req.body;
   let agent = null;
   if (assignedAgentId) {
-    agent = db.get('SELECT id, name, employee_id, role FROM users WHERE id = ? AND is_active = 1', [Number(assignedAgentId)]);
+    agent = toId(assignedAgentId) ? await db.get('SELECT id, name, employee_id, role FROM users WHERE id = ? AND is_active = 1', [toId(assignedAgentId)]) : null;
     if (!agent) return res.status(400).json({ success: false, error: 'Responsible person not found or inactive' });
   }
   let target = issue.target_at;
@@ -625,28 +632,31 @@ router.patch('/:id/assign', authenticate, requireRole(...VERIFIER_ROLES), (req, 
     target = d.toISOString().replace('T', ' ').slice(0, 19);
   } else if (agent && issue.status === 'OPEN') {
     // Target time starts when the admin pushes the complaint to the housekeeper
-    target = location.targetFromNow();
+    target = await location.targetFromNow();
   }
 
   const newStatus = agent && issue.status === 'OPEN' ? 'ASSIGNED' : issue.status;
-  db.run('UPDATE issues SET assigned_agent_id = ?, target_at = ?, status = ? WHERE id = ?',
+  await db.run('UPDATE issues SET assigned_agent_id = ?, target_at = ?, status = ? WHERE id = ?',
     [agent ? agent.id : issue.assigned_agent_id, target, newStatus, issue.id]);
   const remark = `${agent ? `Responsible: ${agent.name} (${agent.employee_id})` : 'Responsible unchanged'}; Target: ${target || 'not set'}`;
-  db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks) VALUES (?, ?, ?, ?, ?)',
+  await db.run('INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks) VALUES (?, ?, ?, ?, ?)',
     [issue.id, req.user.id, issue.status, newStatus, remark]);
 
   if (agent) {
-    slotUtils.notify(agent.id, 'Issue Assigned to You', `${issue.ticket_no}: ${issue.checklist_item_label || issue.category}. Open My Issues, fix it and upload a live photo before the target time.`,
+    await slotUtils.notify(agent.id, 'Issue Assigned to You', `${issue.ticket_no}: ${issue.checklist_item_label || issue.category}. Open My Issues, fix it and upload a live photo before the target time.`,
       'ISSUE_ASSIGNED', { issue_id: issue.id, ticket_no: issue.ticket_no, target_at: target });
   }
-  auditLogFromReq(req, 'ISSUE_ASSIGNED', 'ISSUE', issue.ticket_no, { assigned_agent_id: agent ? agent.id : null, target_at: target });
+  await auditLogFromReq(req, 'ISSUE_ASSIGNED', 'ISSUE', issue.ticket_no, { assigned_agent_id: agent ? agent.id : null, target_at: target });
   res.json({ success: true, message: `${issue.ticket_no} updated.`, status: newStatus, targetAt: target });
 });
 
 // Create Issue (Supervisor / Admin)
 router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_ADMIN'), upload.single('photo'), async (req, res) => {
   try {
-    const { toiletId, areaId, category, description, priority = 'HIGH', assignedAgentId } = req.body;
+    const { category, description, priority = 'HIGH' } = req.body;
+    const toiletId = toId(req.body.toiletId);
+    const areaId = toId(req.body.areaId);
+    const assignedAgentId = toId(req.body.assignedAgentId);
 
     if (!category || !description) {
       return res.status(400).json({ success: false, error: 'Category and description are required' });
@@ -656,7 +666,7 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
     let plantId = req.user.plant_id;
 
     if (toiletId) {
-      toilet = db.get(`
+      toilet = await db.get(`
         SELECT t.*, p.name as plant_name 
         FROM toilets t 
         JOIN plants p ON t.plant_id = p.id 
@@ -675,7 +685,7 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
     let agentId = assignedAgentId || (toilet && toilet.assigned_user_id) || null;
     if (!agentId && toiletId) {
       const todayStr = new Date().toISOString().slice(0, 10);
-      const assignment = db.get(`
+      const assignment = await db.get(`
         SELECT user_id FROM assignments 
         WHERE toilet_id = ? AND assigned_date = ? 
         LIMIT 1
@@ -684,7 +694,7 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
         agentId = assignment.user_id;
       } else {
         // Fallback to any active agent in this plant
-        const fallbackAgent = db.get(`
+        const fallbackAgent = await db.get(`
           SELECT id FROM users 
           WHERE role = 'HOUSEKEEPING_AGENT' AND plant_id = ? AND is_active = 1 
           LIMIT 1
@@ -696,7 +706,7 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
     // Process photo if provided
     let photoPath = null;
     if (req.file || req.body.imageBase64) {
-      photoPath = await saveIssuePhoto(req.file ? req.file.buffer : req.body.imageBase64, toilet ? location.getToiletContext(toilet.id) : null, {
+      photoPath = await saveIssuePhoto(req.file ? req.file.buffer : req.body.imageBase64, toilet ? await location.getToiletContext(toilet.id) : null, {
         photoType: 'ISSUE EVIDENCE',
         reference: 'ISSUE',
         user: req.user,
@@ -704,12 +714,12 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
       });
     }
 
-    const ticketNo = location.nextTicketNo('H360-ISS');
+    const ticketNo = await location.nextTicketNo('H360-ISS');
     const targetAt = req.body.targetAt && !isNaN(new Date(req.body.targetAt).getTime())
       ? new Date(req.body.targetAt).toISOString().replace('T', ' ').slice(0, 19)
-      : location.targetFromNow();
+      : await location.targetFromNow();
 
-    const insertRes = db.run(`
+    const insertRes = await db.run(`
       INSERT INTO issues (ticket_no, plant_id, toilet_id, area_id, category, description, supervisor_id, assigned_agent_id, evidence_photo_path, priority, status, target_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [ticketNo, plantId, toiletId || null, areaId || (toilet ? toilet.area_id : null), category, description, req.user.id, agentId || null, photoPath, priority, agentId ? 'ASSIGNED' : 'OPEN', targetAt]);
@@ -717,7 +727,7 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
     const issueId = insertRes.lastInsertRowid;
 
     // Track in issue updates
-    db.run(`
+    await db.run(`
       INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path)
       VALUES (?, ?, NULL, 'OPEN', 'Issue reported and ticket created', ?)
     `, [issueId, req.user.id, photoPath]);
@@ -727,7 +737,7 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
       const toiletRef = toilet ? toilet.code : 'facility';
       const notificationMsg = `New housekeeping issue reported for ${toiletRef} (${category}). Please take corrective action.`;
 
-      db.run(`
+      await db.run(`
         INSERT INTO notifications (user_id, title, message, type, metadata_json)
         VALUES (?, 'New Housekeeping Issue Assigned', ?, 'ISSUE_ASSIGNED', ?)
       `, [
@@ -737,7 +747,7 @@ router.post('/', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_A
       ]);
     }
 
-    auditLogFromReq(req, 'ISSUE_CREATED', 'ISSUE', ticketNo, {
+    await auditLogFromReq(req, 'ISSUE_CREATED', 'ISSUE', ticketNo, {
       issue_id: issueId,
       category,
       priority,
@@ -763,13 +773,13 @@ router.patch('/:id/status', authenticate, upload.single('photo'), async (req, re
     const issueId = req.params.id;
     const { status, remarks = '' } = req.body;
 
-    const issue = db.get(`
+    const issue = toId(issueId) ? await db.get(`
       SELECT i.*, t.code as toilet_code, t.supervisor_id as toilet_supervisor_id, p.name as plant_name
       FROM issues i 
       LEFT JOIN toilets t ON i.toilet_id = t.id 
       JOIN plants p ON i.plant_id = p.id
       WHERE i.id = ?
-    `, [issueId]);
+    `, [toId(issueId)]) : null;
 
     if (!issue) {
       return res.status(404).json({ success: false, error: 'Issue not found' });
@@ -828,7 +838,7 @@ router.patch('/:id/status', authenticate, upload.single('photo'), async (req, re
     let photoPath = null;
     if (req.file || req.body.imageBase64 || (req.body.resolutionPhoto && req.body.resolutionPhoto.startsWith('data:image'))) {
       const rawBase64 = req.body.imageBase64 || (req.body.resolutionPhoto && req.body.resolutionPhoto.startsWith('data:image') ? req.body.resolutionPhoto : null);
-      photoPath = await saveIssuePhoto(req.file ? req.file.buffer : rawBase64, location.getToiletContext(issue.toilet_id), {
+      photoPath = await saveIssuePhoto(req.file ? req.file.buffer : rawBase64, await location.getToiletContext(issue.toilet_id), {
         photoType: toStatus === 'RESOLVED' ? 'ACTION TAKEN - AFTER' : `${toStatus} EVIDENCE`,
         reference: issue.ticket_no,
         user: req.user,
@@ -854,33 +864,35 @@ router.patch('/:id/status', authenticate, upload.single('photo'), async (req, re
     } else if (toStatus === 'REOPENED') {
       // Rejected action: the after photo stays in the history, a fresh one is needed before the new target time
       updateSql += ', verification_remarks = ?, resolution_photo_path = NULL, resolved_at = NULL, verified_at = NULL, reopened_count = COALESCE(reopened_count, 0) + 1, target_at = ?';
-      updateParams.push(remarks, location.targetFromNow());
+      updateParams.push(remarks, await location.targetFromNow());
     }
 
     updateSql += ' WHERE id = ?';
-    updateParams.push(issueId);
+    updateParams.push(issue.id);
 
-    db.run(updateSql, updateParams);
+    await db.run(updateSql, updateParams);
 
     // Record in history log
-    db.run(`
+    await db.run(`
       INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path)
       VALUES (?, ?, ?, ?, ?, ?)
-    `, [issueId, req.user.id, fromStatus, toStatus, remarks, photoPath]);
+    `, [issue.id, req.user.id, fromStatus, toStatus, remarks, photoPath]);
 
     // Notifications on state change
     if (toStatus === 'RESOLVED') {
       const verifiers = new Set([issue.toilet_supervisor_id, issue.supervisor_id].filter(Boolean));
-      verifiers.forEach(uid => slotUtils.notify(uid, 'Action Taken - Verification Pending',
-        `${issue.ticket_no} at ${issue.toilet_code || 'facility'}: action taken by ${req.user.name} with an after photo. Please verify and close.`,
-        'ISSUE_RESOLVED', { issue_id: Number(issueId), ticket_no: issue.ticket_no }));
+      for (const uid of verifiers) {
+        await slotUtils.notify(uid, 'Action Taken - Verification Pending',
+          `${issue.ticket_no} at ${issue.toilet_code || 'facility'}: action taken by ${req.user.name} with an after photo. Please verify and close.`,
+          'ISSUE_RESOLVED', { issue_id: Number(issueId), ticket_no: issue.ticket_no });
+      }
     } else if (toStatus === 'REOPENED' && issue.assigned_agent_id) {
-      slotUtils.notify(issue.assigned_agent_id, issue.complaint_type === 'CLEANING_AUDIT' ? 'Issue Rolled Back — Resubmit' : 'Issue Reopened',
+      await slotUtils.notify(issue.assigned_agent_id, issue.complaint_type === 'CLEANING_AUDIT' ? 'Issue Rolled Back — Resubmit' : 'Issue Reopened',
         `${issue.ticket_no} at ${issue.toilet_code || 'facility'} was ${issue.complaint_type === 'CLEANING_AUDIT' ? 'rolled back' : 'reopened'} by ${req.user.name}: ${remarks}. Clean again and resubmit with a new live photo.`,
         'ISSUE_ASSIGNED', { issue_id: Number(issueId), ticket_no: issue.ticket_no });
     } else if (toStatus === 'CLOSED' && issue.assigned_agent_id) {
       // Notify agent of successful closure
-      db.run(`
+      await db.run(`
         INSERT INTO notifications (user_id, title, message, type, metadata_json)
         VALUES (?, 'Issue Closed & Verified', ?, 'INFO', ?)
       `, [
@@ -890,7 +902,7 @@ router.patch('/:id/status', authenticate, upload.single('photo'), async (req, re
       ]);
     }
 
-    auditLogFromReq(req, 'ISSUE_STATUS_UPDATED', 'ISSUE', issue.ticket_no, {
+    await auditLogFromReq(req, 'ISSUE_STATUS_UPDATED', 'ISSUE', issue.ticket_no, {
       from_status: fromStatus,
       to_status: toStatus,
       remarks
@@ -908,9 +920,9 @@ router.patch('/:id/status', authenticate, upload.single('photo'), async (req, re
 });
 
 // Single Issue Detail with History
-router.get('/:id', authenticate, (req, res) => {
-  const issueId = req.params.id;
-  const issue = db.get(`
+router.get('/:id', authenticate, async (req, res) => {
+  const issueId = toId(req.params.id);
+  const issue = issueId && await db.get(`
     SELECT i.*, t.code as toilet_code, t.name as toilet_name, t.toilet_uid, t.supervisor_id as toilet_supervisor_id,
            t.gender as toilet_gender, t.area_id as toilet_area_id,
            p.name as plant_name, p.code as plant_code,
@@ -940,7 +952,7 @@ router.get('/:id', authenticate, (req, res) => {
   }
   issue.can_verify = VERIFIER_ROLES.includes(req.user.role) || issue.toilet_supervisor_id === req.user.id;
 
-  const updates = db.all(`
+  const updates = await db.all(`
     SELECT iu.*, u.name as user_name, u.role as user_role
     FROM issue_updates iu
     JOIN users u ON iu.user_id = u.id

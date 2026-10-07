@@ -17,9 +17,9 @@ const FUTURE_INK = 0.025;
 const FUTURE_TIME_GRACE_MIN = 30;
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 
-function layout() {
+async function layout() {
   try {
-    const row = db.get("SELECT value FROM system_settings WHERE key = 'check_sheet_layout'");
+    const row = await db.get("SELECT value FROM system_settings WHERE key = 'check_sheet_layout'");
     if (row && row.value) return { ...DEFAULT_LAYOUT, ...JSON.parse(row.value) };
   } catch (e) {}
   return DEFAULT_LAYOUT;
@@ -75,7 +75,7 @@ function fail(code, message, details = {}) {
  * @param {{ slotStart?: string }} opts slot the cleaning belongs to (HH:MM)
  */
 async function validateSheetTicks(imageBuffer, { slotStart, now = istNow() } = {}) {
-  const cfg = layout();
+  const cfg = await layout();
   const today = Number(now.date.slice(8, 10));
   const month = Number(now.date.slice(5, 7));
   const todayLabel = dayLabel(now.date, today);

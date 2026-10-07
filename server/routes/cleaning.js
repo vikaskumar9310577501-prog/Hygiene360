@@ -1,8 +1,6 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const db = require('../database');
 const { authenticate, requireRole } = require('../middleware/auth');
@@ -14,9 +12,10 @@ const location = require('../utils/location');
 const whatsapp = require('../utils/whatsappService');
 const { checkAgainstRefs, getToiletRefs } = require('../utils/cleanCheck');
 const { validateSheetTicks } = require('../utils/sheetValidator');
+const storage = require('../utils/storage');
 
-function sheetTickVerifyEnabled() {
-  const row = db.get("SELECT value FROM system_settings WHERE key = 'check_sheet_tick_verify'");
+async function sheetTickVerifyEnabled() {
+  const row = await db.get("SELECT value FROM system_settings WHERE key = 'check_sheet_tick_verify'");
   return !row || row.value !== '0';
 }
 
@@ -33,12 +32,6 @@ const upload = multer({
   }
 });
 
-// Directory to store processed evidence images
-const EVIDENCE_DIR = path.join(__dirname, '..', 'uploads', 'evidence');
-if (!fs.existsSync(EVIDENCE_DIR)) {
-  fs.mkdirSync(EVIDENCE_DIR, { recursive: true });
-}
-
 // A rejected cleaning stays open until a newer submission exists for the same toilet slot, or a redo of it
 const OPEN_REJECTED_SQL = `
   cs.approval_status = 'REJECTED' AND NOT EXISTS (
@@ -50,11 +43,11 @@ const OPEN_REJECTED_SQL = `
   )`;
 
 // 1. Get Checklist Master Items
-router.get('/checklist-items', (req, res) => {
+router.get('/checklist-items', async (req, res) => {
   const toilet = req.query.toiletId
-    ? db.get('SELECT id, gender FROM toilets WHERE id = ?', [req.query.toiletId])
+    ? await db.get('SELECT id, gender FROM toilets WHERE id = ?', [req.query.toiletId])
     : null;
-  const items = slotUtils.getChecklistItemsForToilet(toilet);
+  const items = await slotUtils.getChecklistItemsForToilet(toilet);
   const grouped = {
     CLEANLINESS: items.filter(i => i.category === 'CLEANLINESS'),
     CONSUMABLES: items.filter(i => i.category === 'CONSUMABLES'),
@@ -64,38 +57,41 @@ router.get('/checklist-items', (req, res) => {
 });
 
 // Housekeeper marks the start of duty; recorded once per day in the audit trail
-router.post('/shift-start', authenticate, (req, res) => {
+router.post('/shift-start', authenticate, async (req, res) => {
   const ist = slotUtils.istNow();
-  const existing = db.get(`
+  const existing = await db.get(`
     SELECT created_at FROM audit_logs WHERE user_id = ? AND action = 'SHIFT_STARTED' AND entity_id = ?
     ORDER BY id DESC LIMIT 1
   `, [req.user.id, ist.date]);
   if (!existing) {
-    auditLogFromReq(req, 'SHIFT_STARTED', 'SHIFT', ist.date, { toilet_id: req.body.toiletId || null });
+    await auditLogFromReq(req, 'SHIFT_STARTED', 'SHIFT', ist.date, { toilet_id: req.body.toiletId || null });
   }
-  const row = existing || db.get(`
+  const row = existing || await db.get(`
     SELECT created_at FROM audit_logs WHERE user_id = ? AND action = 'SHIFT_STARTED' AND entity_id = ? ORDER BY id DESC LIMIT 1
   `, [req.user.id, ist.date]);
   res.json({ success: true, date: ist.date, startedAt: row ? row.created_at : null, alreadyStarted: !!existing });
 });
 
-router.get('/shift-status', authenticate, (req, res) => {
+router.get('/shift-status', authenticate, async (req, res) => {
   const ist = slotUtils.istNow();
-  const row = db.get(`
+  const row = await db.get(`
     SELECT created_at FROM audit_logs WHERE user_id = ? AND action = 'SHIFT_STARTED' AND entity_id = ? ORDER BY id DESC LIMIT 1
   `, [req.user.id, ist.date]);
   res.json({ success: true, date: ist.date, started: !!row, startedAt: row ? row.created_at : null });
 });
 
 // 2. Start / Initialize Cleaning Session
-router.get('/slot-status/:toiletId', authenticate, (req, res) => {
-  const toilet = db.get('SELECT * FROM toilets WHERE id = ? AND is_active = 1', [Number(req.params.toiletId)]);
+router.get('/slot-status/:toiletId', authenticate, async (req, res) => {
+  const toiletIdNum = Number(req.params.toiletId);
+  const toilet = Number.isInteger(toiletIdNum)
+    ? await db.get('SELECT * FROM toilets WHERE id = ? AND is_active = 1', [toiletIdNum])
+    : null;
   if (!toilet) return res.status(404).json({ success: false, error: 'Toilet not found or inactive' });
   const ist = slotUtils.istNow();
-  const availability = slotUtils.getSlotAvailability(toilet, ist);
+  const availability = await slotUtils.getSlotAvailability(toilet, ist);
   let slot = null;
   if (!availability.blocked) {
-    const resolved = slotUtils.resolveSlotForCleaning(toilet, ist);
+    const resolved = await slotUtils.resolveSlotForCleaning(toilet, ist);
     if (resolved.slot) {
       slot = { ...resolved.slot, range: slotUtils.slotRange(resolved.slot), late: resolved.late };
     }
@@ -103,13 +99,13 @@ router.get('/slot-status/:toiletId', authenticate, (req, res) => {
   res.json({ success: true, ...availability, slot });
 });
 
-router.post('/start', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADMIN', 'PLANT_ADMIN'), (req, res) => {
+router.post('/start', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADMIN', 'PLANT_ADMIN'), async (req, res) => {
   const { toiletId } = req.body;
   if (!toiletId) {
     return res.status(400).json({ success: false, error: 'toiletId is required' });
   }
 
-  const toilet = db.get(`
+  const toilet = await db.get(`
     SELECT t.*, p.name as plant_name 
     FROM toilets t 
     JOIN plants p ON t.plant_id = p.id 
@@ -125,7 +121,7 @@ router.post('/start', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADM
   // Redo of a rejected entry: keeps the original slot and time, so it is allowed outside the slot window
   let redoSource = null;
   if (req.body.redoOf) {
-    redoSource = db.get(`SELECT cs.* FROM cleaning_sessions cs WHERE cs.id = ? AND cs.toilet_id = ? AND ${OPEN_REJECTED_SQL}`, [Number(req.body.redoOf), toilet.id]);
+    redoSource = await db.get(`SELECT cs.* FROM cleaning_sessions cs WHERE cs.id = ? AND cs.toilet_id = ? AND ${OPEN_REJECTED_SQL}`, [Number(req.body.redoOf) || 0, toilet.id]);
     if (!redoSource) {
       return res.status(400).json({ success: false, code: 'REDO_CLOSED', error: 'This rejected cleaning has already been resubmitted.' });
     }
@@ -141,11 +137,11 @@ router.post('/start', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADM
       ? { id: redoSource.slot_id, label: redoSource.slot_label, start_time: redoSource.slot_start, end_time: redoSource.slot_end }
       : null;
   } else {
-    const availability = slotUtils.getSlotAvailability(toilet, ist);
+    const availability = await slotUtils.getSlotAvailability(toilet, ist);
     if (availability.blocked) {
       return res.status(409).json({ success: false, ...availability });
     }
-    activeSlot = slotUtils.resolveSlotForCleaning(toilet, ist).slot;
+    activeSlot = (await slotUtils.resolveSlotForCleaning(toilet, ist)).slot;
   }
 
   const todayStr = new Date().toISOString().slice(0, 10);
@@ -156,7 +152,7 @@ router.post('/start', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADM
   const sessionCode = `H360-${todayStr.replace(/-/g, '')}-${randomSuffix}`;
   const startTime = now.toISOString().replace('T', ' ').slice(0, 19);
 
-  const insertRes = db.run(`
+  const insertRes = await db.run(`
     INSERT INTO cleaning_sessions (session_code, toilet_id, user_id, date, start_time, status,
                                    slot_id, slot_date, slot_label, slot_start, slot_end, redo_of)
     VALUES (?, ?, ?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?)
@@ -172,7 +168,7 @@ router.post('/start', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADM
 
   const newSessionId = insertRes.lastInsertRowid;
 
-  auditLogFromReq(req, 'CLEANING_STARTED', 'TOILET', toilet.code, {
+  await auditLogFromReq(req, 'CLEANING_STARTED', 'TOILET', toilet.code, {
     session_id: newSessionId,
     session_code: sessionCode,
     start_time: startTime,
@@ -180,7 +176,7 @@ router.post('/start', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADM
     redo_of: redoSource ? redoSource.id : null
   });
 
-  const session = db.get('SELECT * FROM cleaning_sessions WHERE id = ?', [newSessionId]);
+  const session = await db.get('SELECT * FROM cleaning_sessions WHERE id = ?', [newSessionId]);
   const slotLate = !redoSource && !!activeSlot && ist.minutes >= slotUtils.toMinutes(activeSlot.end_time);
 
   res.json({
@@ -210,7 +206,7 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
     // MANDATORY SECURITY RULE: Disallow gallery upload for official cleaning evidence
     const isLive = isLiveCamera === 'true' || isLiveCamera === true || isLiveCamera === '1';
     if (!isLive) {
-      auditLogFromReq(req, 'EVIDENCE_REJECTED', 'CLEANING_SESSION', sessionId, {
+      await auditLogFromReq(req, 'EVIDENCE_REJECTED', 'CLEANING_SESSION', sessionId, {
         reason: 'Gallery upload attempted for official cleaning evidence',
         photoType
       });
@@ -236,7 +232,7 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
     }
 
     // Fetch session and toilet details
-    const session = db.get(`
+    const session = await db.get(`
       SELECT cs.*, t.code as toilet_code, t.name as toilet_name, t.plant_id as plant_id, p.name as plant_name
       FROM cleaning_sessions cs
       JOIN toilets t ON cs.toilet_id = t.id
@@ -250,9 +246,9 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
 
     // ANTI-FRAUD RULE 1: Duplicate evidence check via SHA-256 hash
     const rawHash = crypto.createHash('sha256').update(imageBuffer).digest('hex');
-    const duplicateCheck = checkDuplicateEvidence(rawHash, session.id, photoType);
+    const duplicateCheck = await checkDuplicateEvidence(rawHash, session.id, photoType);
     if (duplicateCheck.isDuplicate) {
-      auditLogFromReq(req, 'EVIDENCE_REJECTED', 'CLEANING_SESSION', sessionId, {
+      await auditLogFromReq(req, 'EVIDENCE_REJECTED', 'CLEANING_SESSION', sessionId, {
         reason: 'Duplicate image hash detected',
         photoType,
         hash: rawHash
@@ -265,13 +261,13 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
 
     let cleanCheck = null;
     if (photoType === 'CLEANING_EVIDENCE') {
-      const refs = getToiletRefs(session.toilet_id, 'TOILET');
+      const refs = await getToiletRefs(session.toilet_id, 'TOILET');
       if (refs.length > 0) {
         const startedAt = Date.now();
         cleanCheck = await checkAgainstRefs(imageBuffer, refs.map(r => r.image_url));
         console.log(`[clean-check] session ${sessionId}: ${cleanCheck.passed ? 'PASS' : cleanCheck.code} scene=${cleanCheck.sceneScore} clean=${cleanCheck.cleanScore} in ${Date.now() - startedAt}ms`);
         if (!cleanCheck.passed) {
-          auditLogFromReq(req, 'CLEAN_CHECK_REJECTED', 'CLEANING_SESSION', sessionId, {
+          await auditLogFromReq(req, 'CLEAN_CHECK_REJECTED', 'CLEANING_SESSION', sessionId, {
             code: cleanCheck.code,
             cleanScore: cleanCheck.cleanScore,
             sceneScore: cleanCheck.sceneScore
@@ -283,7 +279,7 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
 
     let ocrDetectedDate = null;
     let sheetCheck = null;
-    const tickVerify = photoType === 'CHECK_SHEET' && sheetTickVerifyEnabled();
+    const tickVerify = photoType === 'CHECK_SHEET' && await sheetTickVerifyEnabled();
     if (tickVerify) {
       const startedAt = Date.now();
       let result;
@@ -295,7 +291,7 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
       }
       console.log(`[sheet-ticks] session ${sessionId}: ${result.valid ? 'VALID' : result.code} ${result.date || ''} ${result.slot || ''} items=${result.itemsTicked ?? '-'}/${result.itemsTotal ?? '-'} in ${Date.now() - startedAt}ms`);
       if (!result.valid) {
-        auditLogFromReq(req, 'CHECK_SHEET_REJECTED', 'CLEANING_SESSION', sessionId, { code: result.code, reason: result.message });
+        await auditLogFromReq(req, 'CHECK_SHEET_REJECTED', 'CLEANING_SESSION', sessionId, { code: result.code, reason: result.message });
         return res.status(422).json({ success: false, code: result.code, error: result.message, sheetCheck: result });
       }
       ocrDetectedDate = `${result.date} ${result.slot}`;
@@ -313,7 +309,7 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
     if (photoType === 'CHECK_SHEET' && !tickVerify) {
       const ocrResult = await validateCheckSheetDate(imageBuffer);
       if (!ocrResult.valid) {
-        auditLogFromReq(req, 'CHECK_SHEET_REJECTED', 'CLEANING_SESSION', sessionId, {
+        await auditLogFromReq(req, 'CHECK_SHEET_REJECTED', 'CLEANING_SESSION', sessionId, {
           reason: ocrResult.message,
           detectedDate: ocrResult.detectedDate,
           detectedTime: ocrResult.detectedTime,
@@ -339,7 +335,7 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
 
     // Apply Server Watermark with official server-controlled time
     const PHOTO_TYPE_LABELS = { CLEANING_EVIDENCE: 'LIVE TOILET PHOTO', CHECK_SHEET: 'CHECKSHEET' };
-    const wmMeta = location.watermarkMeta(location.getToiletContext(session.toilet_id), {
+    const wmMeta = location.watermarkMeta(await location.getToiletContext(session.toilet_id), {
       photoType: PHOTO_TYPE_LABELS[photoType] || photoType.replace(/_/g, ' '),
       reference: session.session_code,
       user: req.user
@@ -347,19 +343,16 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
     const serverTimestampStr = wmMeta.serverTimestampStr;
     const watermarked = await applyWatermark(imageBuffer, wmMeta);
 
-    // Save watermarked file to disk
     const fileName = `H360_${session.session_code}_${photoType}_${Date.now()}.jpg`;
-    const filePath = path.join(EVIDENCE_DIR, fileName);
-    fs.writeFileSync(filePath, watermarked.buffer);
-
     const storagePath = `/uploads/evidence/${fileName}`;
+    await storage.save(storagePath, watermarked.buffer, 'image/jpeg');
     const capturedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
     // Remove any previous photo for this session and photoType
-    db.run('DELETE FROM evidence_photos WHERE session_id = ? AND photo_type = ?', [sessionId, photoType]);
+    await db.run('DELETE FROM evidence_photos WHERE session_id = ? AND photo_type = ?', [sessionId, photoType]);
 
     // Insert into evidence_photos table
-    const photoRes = db.run(`
+    const photoRes = await db.run(`
       INSERT INTO evidence_photos (
         session_id, photo_type, storage_path, original_filename, image_hash,
         captured_at, is_rejected, ocr_detected_date, is_live_camera, uploaded_by, clean_score, scene_score
@@ -378,7 +371,7 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
       cleanCheck && cleanCheck.checked ? cleanCheck.sceneScore : null
     ]);
 
-    auditLogFromReq(req, 'EVIDENCE_UPLOADED', 'CLEANING_SESSION', sessionId, {
+    await auditLogFromReq(req, 'EVIDENCE_UPLOADED', 'CLEANING_SESSION', sessionId, {
       photo_id: photoRes.lastInsertRowid,
       photo_type: photoType,
       hash: watermarked.finalHash.slice(0, 16)
@@ -404,14 +397,14 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
 });
 
 // 4. Submit Completed Cleaning Session
-router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADMIN', 'PLANT_ADMIN'), (req, res) => {
+router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_ADMIN', 'PLANT_ADMIN'), async (req, res) => {
   const { sessionId, checklistResponses = [], remarks = '' } = req.body;
 
   if (!sessionId) {
     return res.status(400).json({ success: false, error: 'sessionId is required' });
   }
 
-  const session = db.get(`
+  const session = await db.get(`
     SELECT cs.*, t.code as toilet_code, t.name as toilet_name, t.plant_id, t.gender as toilet_gender,
            (SELECT name FROM plants WHERE id = t.plant_id) as plant_name
     FROM cleaning_sessions cs
@@ -429,10 +422,10 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
 
   // Someone submitted this slot meanwhile: move this cleaning to the next open slot instead of blocking it
   if (session.slot_id && !session.redo_of) {
-    const alreadyDone = slotUtils.getSlotDoneSession(session.toilet_id, session.slot_id, session.slot_date);
+    const alreadyDone = await slotUtils.getSlotDoneSession(session.toilet_id, session.slot_id, session.slot_date);
     if (alreadyDone && alreadyDone.id !== session.id) {
-      const moved = slotUtils.resolveSlotForCleaning({ id: session.toilet_id, plant_id: session.plant_id }).slot;
-      db.run('UPDATE cleaning_sessions SET slot_id = ?, slot_label = ?, slot_start = ?, slot_end = ? WHERE id = ?',
+      const moved = (await slotUtils.resolveSlotForCleaning({ id: session.toilet_id, plant_id: session.plant_id })).slot;
+      await db.run('UPDATE cleaning_sessions SET slot_id = ?, slot_label = ?, slot_start = ?, slot_end = ? WHERE id = ?',
         [moved ? moved.id : null, moved ? moved.label : null, moved ? moved.start_time : null, moved ? moved.end_time : null, sessionId]);
       Object.assign(session, {
         slot_id: moved ? moved.id : null,
@@ -444,7 +437,7 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
   }
 
   // VALIDATION 1: Check mandatory 3 live photos
-  const uploadedPhotos = db.all(`
+  const uploadedPhotos = await db.all(`
     SELECT photo_type FROM evidence_photos 
     WHERE session_id = ? AND is_rejected = 0
   `, [sessionId]);
@@ -464,7 +457,7 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
   }
 
   // The physical check sheet photo is the checklist; in-app point responses are optional
-  const allMasterItems = slotUtils.getChecklistItemsForToilet({ gender: session.toilet_gender });
+  const allMasterItems = await slotUtils.getChecklistItemsForToilet({ gender: session.toilet_gender });
   const responseMap = {};
   for (const r of Array.isArray(checklistResponses) ? checklistResponses : []) {
     responseMap[r.itemId] = r;
@@ -474,7 +467,7 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
   let passedCount = 0;
   let failedCount = 0;
 
-  db.run('DELETE FROM checklist_responses WHERE session_id = ?', [sessionId]);
+  await db.run('DELETE FROM checklist_responses WHERE session_id = ?', [sessionId]);
 
   for (const item of answeredItems) {
     const resp = responseMap[item.id];
@@ -483,7 +476,7 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
     if (status === 'PASS') passedCount++;
     else failedCount++;
 
-    db.run(`
+    await db.run(`
       INSERT INTO checklist_responses (session_id, item_id, item_label, category, status, fail_reason)
       VALUES (?, ?, ?, ?, ?, ?)
     `, [sessionId, item.id, item.label, item.category, status, failReason]);
@@ -494,7 +487,7 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
   const submitTime = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
   const ist = slotUtils.istNow();
-  const redoSource = session.redo_of ? db.get('SELECT submitted_late FROM cleaning_sessions WHERE id = ?', [session.redo_of]) : null;
+  const redoSource = session.redo_of ? await db.get('SELECT submitted_late FROM cleaning_sessions WHERE id = ?', [session.redo_of]) : null;
   // A redo keeps the timing of the rejected entry it replaces
   const submittedLate = redoSource ? (redoSource.submitted_late ? 1 : 0) : (session.slot_end && (
     ist.date > session.slot_date ||
@@ -502,7 +495,7 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
   ) ? 1 : 0);
 
   // A submitted cleaning is final — no admin approval step
-  db.run(`
+  await db.run(`
     UPDATE cleaning_sessions
     SET status = 'COMPLETED',
         approval_status = 'APPROVED',
@@ -523,44 +516,44 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
     const slotRangeText = slotUtils.slotRange({ start_time: session.slot_start, end_time: session.slot_end });
     const minutesLate = ist.date === session.slot_date ? Math.max(0, ist.minutes - slotUtils.toMinutes(session.slot_end)) : null;
     const lateText = `Late cleaning: ${session.toilet_code} ${session.toilet_name}, slot ${session.slot_label} (${slotRangeText}), submitted ${slotUtils.formatTime12(`${String(Math.floor(ist.minutes / 60)).padStart(2, '0')}:${String(ist.minutes % 60).padStart(2, '0')}`)} by ${req.user.name} (${req.user.employee_id || '-'})${minutesLate !== null ? ` — ${minutesLate} min late` : ''}.`;
-    for (const admin of slotUtils.getPlantAdminRecipients(session.plant_id)) {
-      slotUtils.notify(admin.id, 'Late Cleaning Submitted', lateText, 'LATE_SUBMIT',
+    for (const admin of await slotUtils.getPlantAdminRecipients(session.plant_id)) {
+      await slotUtils.notify(admin.id, 'Late Cleaning Submitted', lateText, 'LATE_SUBMIT',
         { session_id: Number(sessionId), toilet_code: session.toilet_code, slot_label: session.slot_label || null });
     }
-    whatsapp.sendAlert(session.plant_id, 'LATE', `HYGIENE 360 ALERT — ${lateText} Plant: ${session.plant_name || ''}.`);
+    await whatsapp.sendAlert(session.plant_id, 'LATE', `HYGIENE 360 ALERT — ${lateText} Plant: ${session.plant_name || ''}.`);
   }
 
   // A redo answers the admin's issue on the original entry: the issue now waits for the admin's review
   let redoIssue = null;
   if (session.redo_of) {
-    redoIssue = db.get(`
+    redoIssue = await db.get(`
       SELECT id, ticket_no, status FROM issues
       WHERE source_session_id = ? AND complaint_type = 'CLEANING_AUDIT' AND status IN ('OPEN', 'ASSIGNED', 'IN_PROGRESS', 'REOPENED')
       ORDER BY id DESC LIMIT 1
     `, [session.redo_of]);
     if (redoIssue) {
-      const livePhoto = db.get("SELECT storage_path FROM evidence_photos WHERE session_id = ? AND photo_type = 'CLEANING_EVIDENCE' ORDER BY id DESC LIMIT 1", [sessionId]);
-      db.run(`
+      const livePhoto = await db.get("SELECT storage_path FROM evidence_photos WHERE session_id = ? AND photo_type = 'CLEANING_EVIDENCE' ORDER BY id DESC LIMIT 1", [sessionId]);
+      await db.run(`
         UPDATE issues SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP, resolution_photo_path = ?,
                resolution_remarks = ?, source_session_id = ?
         WHERE id = ?
       `, [livePhoto ? livePhoto.storage_path : null, `Cleaning re-done (${session.session_code}). Waiting for admin review.`, Number(sessionId), redoIssue.id]);
-      db.run(`
+      await db.run(`
         INSERT INTO issue_updates (issue_id, user_id, from_status, to_status, remarks, evidence_photo_path)
         VALUES (?, ?, ?, 'RESOLVED', ?, ?)
       `, [redoIssue.id, req.user.id, redoIssue.status, `Cleaning re-done with a new live photo and check sheet (${session.session_code}).`, livePhoto ? livePhoto.storage_path : null]);
-      db.run('UPDATE cleaning_sessions SET issue_id = ? WHERE id = ?', [redoIssue.id, sessionId]);
+      await db.run('UPDATE cleaning_sessions SET issue_id = ? WHERE id = ?', [redoIssue.id, sessionId]);
     }
   }
 
-  auditLogFromReq(req, 'CLEANING_SUBMITTED', 'CLEANING_SESSION', sessionId, {
+  await auditLogFromReq(req, 'CLEANING_SUBMITTED', 'CLEANING_SESSION', sessionId, {
     toilet_code: session.toilet_code,
     score,
     passed_items: passedCount,
     failed_items: failedCount
   });
 
-  const plantSlots = slotUtils.getToiletSlots({ id: session.toilet_id, plant_id: session.plant_id });
+  const plantSlots = await slotUtils.getToiletSlots({ id: session.toilet_id, plant_id: session.plant_id });
   const nextSlot = session.slot_end
     ? slotUtils.findNextSlot(plantSlots, Math.max(ist.minutes, slotUtils.toMinutes(session.slot_end) - 1))
     : slotUtils.findNextSlot(plantSlots, ist.minutes);
@@ -589,13 +582,13 @@ router.post('/submit', authenticate, requireRole('HOUSEKEEPING_AGENT', 'SUPER_AD
 });
 
 // Housekeeper view: today's slots (area-wise, falling back to plant defaults) for each of my assigned toilets
-router.get('/my-slots', authenticate, (req, res) => {
+router.get('/my-slots', authenticate, async (req, res) => {
   const ist = slotUtils.istNow();
   const isHousekeeper = req.user.role === 'HOUSEKEEPING_AGENT' || req.user.role === 'HOUSEKEEPING';
 
   let toilets;
   if (isHousekeeper) {
-    toilets = db.all(`
+    toilets = await db.all(`
       SELECT t.id, t.code, t.name, t.gender, t.plant_id, t.area_id, a.name as area_name FROM toilets t
       LEFT JOIN areas a ON t.area_id = a.id
       WHERE t.is_active = 1 AND t.plant_id = ?
@@ -603,7 +596,7 @@ router.get('/my-slots', authenticate, (req, res) => {
     `, [req.user.plant_id || -1]);
   } else {
     toilets = req.user.plant_id
-      ? db.all(`
+      ? await db.all(`
           SELECT t.id, t.code, t.name, t.gender, t.plant_id, t.area_id, a.name as area_name FROM toilets t
           LEFT JOIN areas a ON t.area_id = a.id
           WHERE t.is_active = 1 AND t.plant_id = ? ORDER BY t.code
@@ -614,25 +607,28 @@ router.get('/my-slots', authenticate, (req, res) => {
   const fmt = s => s ? { ...s, range: slotUtils.slotRange(s), minutes_left: slotUtils.toMinutes(s.end_time) - ist.minutes, starts_in: slotUtils.toMinutes(s.start_time) - ist.minutes } : null;
 
   const allSlots = new Map();
-  const rows = toilets.map(t => {
-    const slots = slotUtils.getToiletSlots(t);
+  const rows = [];
+  for (const t of toilets) {
+    const slots = await slotUtils.getToiletSlots(t);
     slots.forEach(s => allSlots.set(s.id, s));
     const current = slotUtils.findCurrentSlot(slots, ist.minutes);
-    return {
+    const cells = [];
+    for (const s of slots) {
+      const sess = await slotUtils.getLatestSlotSession(t.id, s.id, ist.date);
+      cells.push({
+        slot_id: s.id,
+        status: slotUtils.computeCellStatus(s, sess, ist.date, ist),
+        submit_time: sess && sess.status === 'COMPLETED' ? sess.submit_time : null,
+        approved_at: sess ? sess.approved_at : null,
+        approval_remarks: sess ? sess.approval_remarks : null
+      });
+    }
+    rows.push({
       ...t,
       current_slot_id: current ? current.id : null,
-      cells: slots.map(s => {
-        const sess = slotUtils.getLatestSlotSession(t.id, s.id, ist.date);
-        return {
-          slot_id: s.id,
-          status: slotUtils.computeCellStatus(s, sess, ist.date, ist),
-          submit_time: sess && sess.status === 'COMPLETED' ? sess.submit_time : null,
-          approved_at: sess ? sess.approved_at : null,
-          approval_remarks: sess ? sess.approval_remarks : null
-        };
-      })
-    };
-  });
+      cells
+    });
+  }
 
   const slots = [...allSlots.values()].sort((a, b) => a.start_time.localeCompare(b.start_time));
   const currents = slots.filter(s => rows.some(r => r.current_slot_id === s.id));
@@ -651,8 +647,8 @@ router.get('/my-slots', authenticate, (req, res) => {
 });
 
 // Housekeeper: rejected cleanings that still need to be fixed and resubmitted
-router.get('/my-rejected', authenticate, (req, res) => {
-  const list = db.all(`
+router.get('/my-rejected', authenticate, async (req, res) => {
+  const list = await db.all(`
     SELECT cs.id, cs.session_code, cs.toilet_id, cs.slot_id, cs.slot_date, cs.slot_label, cs.slot_start, cs.slot_end,
            cs.submit_time, cs.checklist_score, cs.approval_remarks, cs.approved_by_name, cs.approved_at,
            t.code as toilet_code, t.name as toilet_name, t.gender as toilet_gender, t.plant_id,
@@ -672,10 +668,10 @@ router.get('/my-rejected', authenticate, (req, res) => {
 });
 
 // Housekeeper: my submitted cleanings with their approval result
-router.get('/my-history', authenticate, (req, res) => {
+router.get('/my-history', authenticate, async (req, res) => {
   const days = Math.min(Math.max(Number(req.query.days) || 7, 1), 60);
   const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
-  const list = db.all(`
+  const list = await db.all(`
     SELECT cs.id, cs.session_code, COALESCE(cs.slot_date, cs.date) as day, cs.slot_label, cs.slot_start, cs.slot_end,
            cs.submit_time, cs.status, cs.approval_status, cs.approved_by_name, cs.approved_at, cs.approval_remarks,
            cs.checklist_score, cs.submitted_late, cs.redo_of, cs.start_time, cs.is_fake_audit_flagged,
@@ -691,7 +687,7 @@ router.get('/my-history', authenticate, (req, res) => {
 });
 
 // 5. Get Today's Cleaning Overview / List
-router.get('/today', authenticate, (req, res) => {
+router.get('/today', authenticate, async (req, res) => {
   const todayStr = new Date().toISOString().slice(0, 10);
   let query = `
     SELECT cs.*, t.code as toilet_code, t.name as toilet_name, t.gender as toilet_gender,
@@ -716,14 +712,14 @@ router.get('/today', authenticate, (req, res) => {
 
   query += ' ORDER BY cs.submit_time DESC, cs.id DESC';
 
-  const sessions = db.all(query, params);
+  const sessions = await db.all(query, params);
   res.json({ success: true, sessions });
 });
 
 // 6. Get Single Session Details with Responses and Evidence
-router.get('/session/:id', authenticate, (req, res) => {
+router.get('/session/:id', authenticate, async (req, res) => {
   const sessionId = req.params.id;
-  const session = db.get(`
+  const session = await db.get(`
     SELECT cs.*, t.code as toilet_code, t.name as toilet_name, t.gender as toilet_gender, t.toilet_uid,
            p.name as plant_name, p.code as plant_code, a.name as area_name,
            u.name as agent_name, u.employee_id as agent_emp_id
@@ -743,10 +739,10 @@ router.get('/session/:id', authenticate, (req, res) => {
     return res.status(403).json({ success: false, error: 'You can only view your own cleanings.' });
   }
   session.issue = session.issue_id
-    ? db.get('SELECT id, ticket_no, status FROM issues WHERE id = ?', [session.issue_id]) || null
+    ? (await db.get('SELECT id, ticket_no, status FROM issues WHERE id = ?', [session.issue_id])) || null
     : null;
 
-  const responses = db.all(`
+  const responses = await db.all(`
     SELECT cr.*, ci.order_num 
     FROM checklist_responses cr
     LEFT JOIN checklist_items ci ON cr.item_id = ci.id
@@ -754,7 +750,7 @@ router.get('/session/:id', authenticate, (req, res) => {
     ORDER BY ci.order_num ASC
   `, [sessionId]);
 
-  const photos = db.all(`
+  const photos = await db.all(`
     SELECT id, photo_type, storage_path, image_hash, captured_at, server_received_at, ocr_detected_date, is_live_camera
     FROM evidence_photos
     WHERE session_id = ?

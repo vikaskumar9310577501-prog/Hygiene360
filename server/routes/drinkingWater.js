@@ -1,9 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const db = require('../database');
+const storage = require('../utils/storage');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { auditLogFromReq } = require('../middleware/audit');
 const { applyWatermark } = require('../utils/watermark');
@@ -12,9 +11,6 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, fieldSize: 15 * 1024 * 1024 }
 });
-
-const EVIDENCE_DIR = path.join(__dirname, '..', 'uploads', 'evidence');
-
 // Submit Drinking Water Inspection
 router.post('/check', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PLANT_ADMIN'), upload.single('photo'), async (req, res) => {
   try {
@@ -37,7 +33,7 @@ router.post('/check', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PL
       return res.status(400).json({ success: false, error: 'plantId is required' });
     }
 
-    const plant = db.get('SELECT name, code FROM plants WHERE id = ?', [actualPlantId]);
+    const plant = await db.get('SELECT name, code FROM plants WHERE id = ?', [actualPlantId]);
     if (!plant) {
       return res.status(404).json({ success: false, error: 'Plant not found' });
     }
@@ -67,11 +63,10 @@ router.post('/check', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PL
       });
 
       const fileName = `H360_DW_${Date.now()}.jpg`;
-      fs.writeFileSync(path.join(EVIDENCE_DIR, fileName), watermarked.buffer);
-      photoPath = `/uploads/evidence/${fileName}`;
+      photoPath = await storage.save(`/uploads/evidence/${fileName}`, watermarked.buffer, 'image/jpeg');
     }
 
-    const insertRes = db.run(`
+    const insertRes = await db.run(`
       INSERT INTO drinking_water_checks (
         plant_id, area_id, point_name, supervisor_id,
         water_available, dispenser_clean, drinking_area_clean, glasses_available,
@@ -94,7 +89,7 @@ router.post('/check', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PL
       photoPath
     ]);
 
-    auditLogFromReq(req, 'DRINKING_WATER_CHECK', 'WATER_POINT', pointName, {
+    await auditLogFromReq(req, 'DRINKING_WATER_CHECK', 'WATER_POINT', pointName, {
       check_id: insertRes.lastInsertRowid,
       status,
       water_available: waterAvailable,
@@ -114,7 +109,7 @@ router.post('/check', authenticate, requireRole('SUPERVISOR', 'SUPER_ADMIN', 'PL
 });
 
 // List drinking water checks
-router.get('/', authenticate, (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   let query = `
     SELECT dw.*, p.name as plant_name, a.name as area_name, u.name as supervisor_name
     FROM drinking_water_checks dw
@@ -132,7 +127,7 @@ router.get('/', authenticate, (req, res) => {
 
   query += ' ORDER BY dw.created_at DESC LIMIT 50';
 
-  const checks = db.all(query, params);
+  const checks = await db.all(query, params);
   res.json({ success: true, checks });
 });
 
