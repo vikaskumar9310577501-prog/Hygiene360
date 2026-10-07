@@ -3,6 +3,7 @@
 //   npm run migrate:supabase                 copy data + photos (target database must be empty)
 //   npm run migrate:supabase -- --reset      wipe the Supabase tables first, then copy
 //   npm run migrate:supabase -- --skip-photos
+//   npm run migrate:supabase -- --photos-only   upload server/uploads again (data untouched)
 //
 // Needs DATABASE_URL (and SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY for photos) in the root .env.
 const path = require('path');
@@ -22,6 +23,7 @@ const SQLITE_FILE = path.join(__dirname, '..', 'hygiene360.db');
 const args = new Set(process.argv.slice(2));
 const RESET = args.has('--reset');
 const SKIP_PHOTOS = args.has('--skip-photos');
+const PHOTOS_ONLY = args.has('--photos-only');
 const BATCH = 200;
 
 // Parent tables first so foreign keys resolve
@@ -124,6 +126,7 @@ async function copyPhotos() {
 }
 
 async function main() {
+  if (PHOTOS_ONLY) return copyPhotos();
   if (!fs.existsSync(SQLITE_FILE)) throw new Error(`Local database not found: ${SQLITE_FILE}`);
   const sqlite = new DatabaseSync(SQLITE_FILE, { readOnly: true });
 

@@ -31,14 +31,29 @@ function contentTypeOf(key) {
   return { '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' }[ext] || 'image/jpeg';
 }
 
+let bucketChecked = false;
+async function ensureBucket() {
+  if (bucketChecked) return;
+  const { error } = await supabase().storage.createBucket(BUCKET, { public: false });
+  if (error && !/already exists|duplicate/i.test(error.message)) {
+    throw new Error(`Could not create storage bucket "${BUCKET}": ${error.message}`);
+  }
+  bucketChecked = true;
+}
+
 async function save(urlPath, buffer, contentType) {
   const key = keyOf(urlPath);
   if (!key) throw new Error(`Invalid storage path: ${urlPath}`);
   if (useSupabase) {
-    const { error } = await supabase().storage.from(BUCKET).upload(key, buffer, {
+    const upload = () => supabase().storage.from(BUCKET).upload(key, buffer, {
       contentType: contentType || contentTypeOf(key),
       upsert: true
     });
+    let { error } = await upload();
+    if (error && /bucket not found/i.test(error.message)) {
+      await ensureBucket();
+      ({ error } = await upload());
+    }
     if (error) throw new Error(`Photo upload to storage failed: ${error.message}`);
     return urlPath;
   }
