@@ -14,7 +14,9 @@ const REJECT_COOLDOWN_MS = 4000;
 const MAX_PHOTO_AGE_MS = 2 * 60 * 1000;
 // The server also serves the app over HTTPS on this port; browsers allow the live camera only on HTTPS
 const HTTPS_PORT = 5443;
-const SECURE_URL = typeof window !== 'undefined' ? `https://${window.location.hostname}:${HTTPS_PORT}/` : '';
+const SECURE_URL = typeof window !== 'undefined'
+  ? `https://${window.location.hostname}${/^\d{1,3}(\.\d{1,3}){3}$/.test(window.location.hostname) ? `:${HTTPS_PORT}` : ''}/`
+  : '';
 
 function extractH360Token(raw) {
   const text = String(raw || '');

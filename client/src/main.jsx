@@ -7,9 +7,11 @@ import App from './App.jsx'
 const HTTPS_PORT = 5443;
 const { protocol, hostname, pathname, search, hash } = window.location;
 const isLocal = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+const isLanIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname);
 
 if (protocol === 'http:' && !isLocal) {
-  window.location.replace(`https://${hostname}:${HTTPS_PORT}${pathname}${search}${hash}`);
+  const port = isLanIp ? `:${HTTPS_PORT}` : '';
+  window.location.replace(`https://${hostname}${port}${pathname}${search}${hash}`);
 } else {
   createRoot(document.getElementById('root')).render(
     <StrictMode>

@@ -12,6 +12,7 @@ const location = require('../utils/location');
 // Phones must reach the app over HTTPS for the live camera; set PUBLIC_APP_URL when the server has a fixed address
 function publicBaseUrl() {
   if (process.env.PUBLIC_APP_URL) return process.env.PUBLIC_APP_URL.replace(/\/+$/, '');
+  if (process.env.VERCEL_PROJECT_PRODUCTION_URL) return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
   const lanIp = Object.values(os.networkInterfaces()).flat()
     .find(n => n && n.family === 'IPv4' && !n.internal)?.address || 'localhost';
   return `https://${lanIp}:${process.env.HTTPS_PORT || 5443}`;
