@@ -29,6 +29,21 @@ app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
+// Health check endpoint (answers even when the database is down, to show what is wrong)
+app.get('/api/health', async (req, res) => {
+  let databaseError = null;
+  try { await db.ensureReady(); } catch (err) { databaseError = err.message; }
+  res.status(databaseError ? 503 : 200).json({
+    status: databaseError ? 'DEGRADED' : 'ONLINE',
+    system: 'HYGIENE 360 Enterprise Housekeeping Management',
+    serverTime: new Date().toISOString(),
+    database: db.dialect,
+    databaseError,
+    storage: storage.useSupabase ? 'supabase' : 'local',
+    version: '1.0.0'
+  });
+});
+
 // Schema / migrations must finish before the first query
 app.use(async (req, res, next) => {
   try { await db.ensureReady(); next(); } catch (err) { next(err); }
@@ -64,18 +79,6 @@ app.get('/api/cron/slots', async (req, res) => {
   }
   await safeRun();
   res.json({ success: true, ranAt: new Date().toISOString() });
-});
-
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ONLINE',
-    system: 'HYGIENE 360 Enterprise Housekeeping Management',
-    serverTime: new Date().toISOString(),
-    database: db.dialect,
-    storage: storage.useSupabase ? 'supabase' : 'local',
-    version: '1.0.0'
-  });
 });
 
 // Serve frontend in production (Vercel serves client/dist itself)

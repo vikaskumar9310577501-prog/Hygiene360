@@ -3,7 +3,14 @@
 require('dotenv').config();
 
 const usePg = !!process.env.DATABASE_URL;
-const impl = usePg ? require('./db/pg') : require('./db/sqlite');
+
+// Serverless disks are read-only, so the SQLite fallback cannot work there
+function missingDatabase() {
+  const fail = async () => { throw new Error('DATABASE_URL is not configured on the server. Add it in Vercel > Settings > Environment Variables and redeploy.'); };
+  return { dialect: 'none', initSchema: fail, all: fail, get: fail, run: fail, exec: fail };
+}
+
+const impl = usePg ? require('./db/pg') : process.env.VERCEL ? missingDatabase() : require('./db/sqlite');
 
 function sanitizeUidPart(value) {
   return String(value || '').toUpperCase().trim().replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -44,6 +51,7 @@ async function backfillToiletUids() {
 // A failed init (e.g. database briefly unreachable on a cold start) is retried on the next request
 let readyPromise = null;
 function ensureReady() {
+  if (impl.dialect === 'none') return impl.initSchema();
   if (!usePg) return Promise.resolve();
   if (!readyPromise) {
     readyPromise = (async () => {
