@@ -267,12 +267,17 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
         cleanCheck = await checkAgainstRefs(imageBuffer, refs.map(r => r.image_url));
         console.log(`[clean-check] session ${sessionId}: ${cleanCheck.passed ? 'PASS' : cleanCheck.code} scene=${cleanCheck.sceneScore} clean=${cleanCheck.cleanScore} in ${Date.now() - startedAt}ms`);
         if (!cleanCheck.passed) {
-          await auditLogFromReq(req, 'CLEAN_CHECK_REJECTED', 'CLEANING_SESSION', sessionId, {
-            code: cleanCheck.code,
-            cleanScore: cleanCheck.cleanScore,
-            sceneScore: cleanCheck.sceneScore
-          });
-          return res.status(422).json({ success: false, code: cleanCheck.code, error: cleanCheck.message, cleanCheck });
+          // Low scores are saved and flagged for supervisor review instead of forcing a retake;
+          // only a photo of a completely different place is refused
+          const floorRow = await db.get("SELECT value FROM system_settings WHERE key = 'clean_check_hard_min_scene'");
+          const hardMinScene = floorRow && Number.isFinite(Number(floorRow.value)) ? Number(floorRow.value) : 10;
+          const details = { code: cleanCheck.code, cleanScore: cleanCheck.cleanScore, sceneScore: cleanCheck.sceneScore };
+          if (cleanCheck.sceneScore != null && cleanCheck.sceneScore < hardMinScene) {
+            await auditLogFromReq(req, 'CLEAN_CHECK_REJECTED', 'CLEANING_SESSION', sessionId, details);
+            return res.status(422).json({ success: false, code: cleanCheck.code, error: cleanCheck.message, cleanCheck });
+          }
+          await auditLogFromReq(req, 'CLEAN_CHECK_FLAGGED', 'CLEANING_SESSION', sessionId, details);
+          cleanCheck = { ...cleanCheck, passed: true, flagged: true, message: 'Photo saved. Marked for supervisor review (low match with the reference).' };
         }
       }
     }

@@ -9,7 +9,9 @@ const MAX_PHOTO_SIDE = 1600;
 const AUTO_CAPTURE_STREAK = 2;
 const GUIDE_INTERVAL_MS = 250;
 // After this long the manual button unlocks even without a match; the server still verifies the photo
-const GUIDE_UNLOCK_MS = 8000;
+const GUIDE_UNLOCK_MS = 3000;
+// Housekeepers must never be stuck: the photo is taken automatically by this time
+const GUIDE_FORCE_CAPTURE_MS = 10000;
 
 function fitSize(w, h) {
   const scale = Math.min(1, MAX_PHOTO_SIDE / Math.max(w, h));
@@ -103,8 +105,9 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
   useEffect(() => {
     setGuideUnlocked(false);
     if (!isOpen || !stream || !guideMode || capturedImage) return;
-    const timer = setTimeout(() => setGuideUnlocked(true), GUIDE_UNLOCK_MS);
-    return () => clearTimeout(timer);
+    const unlock = setTimeout(() => setGuideUnlocked(true), GUIDE_UNLOCK_MS);
+    const force = setTimeout(() => captureRef.current?.(), GUIDE_FORCE_CAPTURE_MS);
+    return () => { clearTimeout(unlock); clearTimeout(force); };
   }, [isOpen, stream, guideMode, capturedImage]);
 
   // Keep videoRef attached to stream whenever stream is active

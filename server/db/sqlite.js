@@ -473,6 +473,7 @@ function initSchema() {
     db.exec('CREATE INDEX IF NOT EXISTS idx_toilet_refs ON toilet_reference_photos(toilet_id, kind)');
     db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('clean_check_min_score', '50', 'Minimum clean score (0-100) for a live toilet photo to be accepted')");
     db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('clean_check_min_scene', '25', 'Minimum match (0-100) with the toilet reference view')");
+    db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('clean_check_hard_min_scene', '10', 'Below this match (0-100) the toilet photo is refused; between this and the minimum it is saved and flagged for review')");
     const relaxedOnce = "NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'photo_match_relaxed_v1')";
     db.exec(`UPDATE system_settings SET value = '25' WHERE key = 'clean_check_min_scene' AND value IN ('35', '45') AND ${relaxedOnce}`);
     db.exec(`UPDATE system_settings SET value = '50' WHERE key = 'clean_check_min_score' AND value = '60' AND ${relaxedOnce}`);

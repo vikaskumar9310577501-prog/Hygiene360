@@ -5,8 +5,8 @@ const STEP = 2;
 const CROPS = [1, 0.85, 0.72];
 
 // Roughly the same angle is enough; the server still checks cleanliness against the reference
-export const ALIGN_SCORE = 0.33;
-export const NEAR_SCORE = 0.18;
+export const ALIGN_SCORE = 0.25;
+export const NEAR_SCORE = 0.12;
 const CENTER_TOLERANCE = 6;
 // A zoom/shift hint is only given when it is clearly better than the current framing
 const ZOOM_MARGIN = 0.05;

@@ -416,6 +416,7 @@ INSERT INTO system_settings (key, value, description) VALUES
   ('whatsapp_summary_time', '20:00', 'Time (IST) of the end-of-day WhatsApp summary'),
   ('clean_check_min_score', '50', 'Minimum clean score (0-100) for a live toilet photo to be accepted'),
   ('clean_check_min_scene', '25', 'Minimum match (0-100) with the toilet reference view'),
+  ('clean_check_hard_min_scene', '10', 'Below this match (0-100) the toilet photo is refused; between this and the minimum it is saved and flagged for review'),
   ('sheet_check_min_match', '22', 'Minimum match (0-100) with the check sheet reference photos'),
   ('check_sheet_tick_verify', '1', 'Read ticks on the check sheet photo and refuse wrong date / time slot (1 = on, 0 = off)'),
   ('check_sheet_layout', '{"items":["Floor","Wall","Mirror","Wash Basin","Handwash","Urinal","WC","Dustbin"],"timings":["08:00","11:00","13:00","15:00","17:00"],"requireAllItems":true}', 'Printed check sheet columns: item names, timing columns (HH:MM) and whether every item must be ticked'),
