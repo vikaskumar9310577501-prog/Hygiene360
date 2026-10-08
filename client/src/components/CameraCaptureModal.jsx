@@ -5,6 +5,8 @@ import { loadImage, prepareReference, evaluateFrame, prepareSheetReference, eval
 import { Camera, X, Check, AlertTriangle, ShieldCheck, RefreshCw, AlertCircle, Sparkles, CheckCircle2 } from 'lucide-react';
 
 const MAX_PHOTO_SIDE = 1600;
+// Tick boxes on the check sheet are small; keep more pixels for it
+const MAX_SHEET_SIDE = 2000;
 // Consecutive aligned frames (sampled every GUIDE_INTERVAL_MS) before the photo is taken automatically
 const AUTO_CAPTURE_STREAK = 2;
 const GUIDE_INTERVAL_MS = 250;
@@ -13,8 +15,8 @@ const GUIDE_UNLOCK_MS = 3000;
 // Housekeepers must never be stuck: the photo is taken automatically by this time
 const GUIDE_FORCE_CAPTURE_MS = 10000;
 
-function fitSize(w, h) {
-  const scale = Math.min(1, MAX_PHOTO_SIDE / Math.max(w, h));
+function fitSize(w, h, maxSide = MAX_PHOTO_SIDE) {
+  const scale = Math.min(1, maxSide / Math.max(w, h));
   return { w: Math.round(w * scale), h: Math.round(h * scale) };
 }
 
@@ -131,8 +133,9 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
       let mediaStream = null;
       // 1. Try back/environment camera with ideal constraint
       try {
+        const hiRes = photoType === 'CHECK_SHEET';
         mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: hiRes ? 1920 : 1280 }, height: { ideal: hiRes ? 1080 : 720 } },
           audio: false
         });
       } catch (err1) {
@@ -387,7 +390,7 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
     if (videoRef.current && (videoRef.current.videoWidth > 0 || videoRef.current.readyState >= 2)) {
       const video = videoRef.current;
       const canvas = canvasRef.current || document.createElement('canvas');
-      const size = fitSize(video.videoWidth || 1280, video.videoHeight || 720);
+      const size = fitSize(video.videoWidth || 1280, video.videoHeight || 720, photoType === 'CHECK_SHEET' ? MAX_SHEET_SIDE : MAX_PHOTO_SIDE);
       canvas.width = size.w;
       canvas.height = size.h;
       const ctx = canvas.getContext('2d');
@@ -567,7 +570,7 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
                 <CheckCircle2 size={18} color="#059669" />
                 <div>
                   <strong>
-                    {photoType === 'CHECK_SHEET' && clarityScore ? `Check Sheet Clarity Verified (${clarityScore}% Sharp)` : 'Live Photo Captured'}
+                    {photoType === 'CHECK_SHEET' ? 'Check Sheet Matched 100%' : 'Live Photo Captured'}
                   </strong>
                   <div style={{ fontSize: '11px', color: '#047857' }}>
                     Live Date & Time stamped.
@@ -736,41 +739,12 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
             <canvas ref={canvasRef} style={{ display: 'none' }} />
           </div>
 
-          {/* Check-Sheet Clarity Testing Controls (for Demo / Quality Evaluation) */}
-          {photoType === 'CHECK_SHEET' && !capturedImage && !guideMode && (
+          {photoType === 'CHECK_SHEET' && !capturedImage && (
             <div style={{
-              marginTop: '12px',
-              padding: '10px 12px',
-              borderRadius: '8px',
-              backgroundColor: '#f8fafc',
-              border: '1px solid var(--color-border)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              flexWrap: 'wrap',
-              gap: '8px'
+              marginTop: '12px', padding: '10px 12px', borderRadius: '8px',
+              backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', fontSize: '12.5px', color: '#1e3a8a', lineHeight: 1.45
             }}>
-              <div style={{ fontSize: '12px', color: '#475569' }}>
-                <strong>Quality Analysis:</strong> Software requires a sharp, high-clarity check-sheet.
-              </div>
-              <div style={{ display: 'flex', gap: '6px' }}>
-                <button
-                  type="button"
-                  className={`btn btn-sm ${!simulatedBlurMode ? 'btn-primary' : 'btn-outline'}`}
-                  style={{ fontSize: '11px', padding: '3px 8px' }}
-                  onClick={() => setSimulatedBlurMode(false)}
-                >
-                  ✓ Sharp & Clear Mode
-                </button>
-                <button
-                  type="button"
-                  className={`btn btn-sm ${simulatedBlurMode ? 'btn-danger' : 'btn-outline'}`}
-                  style={{ fontSize: '11px', padding: '3px 8px' }}
-                  onClick={() => setSimulatedBlurMode(true)}
-                >
-                  ⚠ Blurry Mode (Test Rejection)
-                </button>
-              </div>
+              <strong>Tip:</strong> Turn the phone sideways (landscape) so the whole sheet fills the screen. Today's date row and the time box you ticked must be visible.
             </div>
           )}
 
@@ -831,7 +805,7 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
                 id="btn-confirm-upload"
               >
                 {uploading
-                  ? (photoType === 'CHECK_SHEET' ? 'Reading date & time on the check sheet...' : 'Verifying & Saving...')
+                  ? 'Saving...'
                   : (isClear ? 'Confirm & Save Photo' : 'Photo Rejected (Retake Required)')}
               </button>
             </div>

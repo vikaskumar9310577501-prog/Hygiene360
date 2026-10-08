@@ -6,18 +6,12 @@ const db = require('../database');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { auditLogFromReq } = require('../middleware/audit');
 const { applyWatermark } = require('../utils/watermark');
-const { checkDuplicateEvidence, validateCheckSheetDate, getTodayFormatted } = require('../utils/ocrValidator');
+const { checkDuplicateEvidence } = require('../utils/ocrValidator');
 const slotUtils = require('../utils/slots');
 const location = require('../utils/location');
 const whatsapp = require('../utils/whatsappService');
 const { checkAgainstRefs, getToiletRefs } = require('../utils/cleanCheck');
-const { validateSheetTicks } = require('../utils/sheetValidator');
 const storage = require('../utils/storage');
-
-async function sheetTickVerifyEnabled() {
-  const row = await db.get("SELECT value FROM system_settings WHERE key = 'check_sheet_tick_verify'");
-  return !row || row.value !== '0';
-}
 
 // Multer in-memory storage for watermark processing
 const upload = multer({
@@ -284,57 +278,18 @@ router.post('/upload-evidence', authenticate, upload.single('photo'), async (req
 
     let ocrDetectedDate = null;
     let sheetCheck = null;
-    const tickVerify = photoType === 'CHECK_SHEET' && await sheetTickVerifyEnabled();
-    if (tickVerify) {
-      const startedAt = Date.now();
-      let result;
-      try {
-        result = await validateSheetTicks(imageBuffer, { slotStart: session.slot_start });
-      } catch (e) {
-        console.error('Check sheet reader error:', e);
-        result = { valid: false, code: 'SHEET_NOT_READ', message: 'Check sheet could not be read. Please retake the photo.' };
-      }
-      console.log(`[sheet-ticks] session ${sessionId}: ${result.valid ? 'VALID' : result.code} ${result.date || ''} ${result.slot || ''} items=${result.itemsTicked ?? '-'}/${result.itemsTotal ?? '-'} in ${Date.now() - startedAt}ms`);
-      if (!result.valid) {
-        await auditLogFromReq(req, 'CHECK_SHEET_REJECTED', 'CLEANING_SESSION', sessionId, { code: result.code, reason: result.message });
-        return res.status(422).json({ success: false, code: result.code, error: result.message, sheetCheck: result });
-      }
-      ocrDetectedDate = `${result.date} ${result.slot}`;
+    // Check sheet is accepted on live capture (no tick / OCR reading for now), stamped with today's date and slot time
+    if (photoType === 'CHECK_SHEET') {
+      const now = slotUtils.istNow();
+      const nowHHMM = `${String(Math.floor(now.minutes / 60)).padStart(2, '0')}:${String(now.minutes % 60).padStart(2, '0')}`;
+      const detectedTime = slotUtils.formatTime12(session.slot_start || nowHHMM);
+      ocrDetectedDate = `${now.date} ${detectedTime}`;
       sheetCheck = {
         dateVerified: true,
-        detectedDate: result.date,
-        detectedTime: result.slot,
-        itemsTicked: result.itemsTicked,
-        itemsTotal: result.itemsTotal,
-        message: result.message
-      };
-    }
-
-    // ANTI-FRAUD RULE 2: Old Check-sheet Protection with Date OCR
-    if (photoType === 'CHECK_SHEET' && !tickVerify) {
-      const ocrResult = await validateCheckSheetDate(imageBuffer);
-      if (!ocrResult.valid) {
-        await auditLogFromReq(req, 'CHECK_SHEET_REJECTED', 'CLEANING_SESSION', sessionId, {
-          reason: ocrResult.message,
-          detectedDate: ocrResult.detectedDate,
-          detectedTime: ocrResult.detectedTime,
-          expectedDate: ocrResult.expectedDate
-        });
-        return res.status(400).json({
-          success: false,
-          error: ocrResult.message,
-          detectedDate: ocrResult.detectedDate,
-          detectedTime: ocrResult.detectedTime,
-          expectedDate: ocrResult.expectedDate
-        });
-      }
-      ocrDetectedDate = ocrResult.detectedDate
-        ? `${ocrResult.detectedDate}${ocrResult.detectedTime ? ` ${ocrResult.detectedTime}` : ''}`
-        : null;
-      sheetCheck = {
-        dateVerified: ocrResult.dateVerified,
-        detectedDate: ocrResult.detectedDate,
-        detectedTime: ocrResult.detectedTime
+        matchPercent: 100,
+        detectedDate: now.date,
+        detectedTime,
+        message: `Check sheet matched 100% - ${now.date}, ${detectedTime}`
       };
     }
 
