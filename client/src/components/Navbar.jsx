@@ -109,7 +109,9 @@ export default function Navbar({ activeTab, adminTab, onAdminTabChange, onOpenQR
         title={`Filter by Plant and Date (${activePlantLabel} • ${dateFilter})`}
       >
         <Filter size={13} color="#0284c7" />
-        <span style={{ color: 'var(--color-primary-900)' }}>Filter</span>
+        <span style={{ color: 'var(--color-primary-900)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {activePlant ? `${activePlant.location ? `${activePlant.location} • ` : ''}${activePlantLabel}` : 'All Plants'}
+        </span>
         <ChevronDown size={12} color="#64748b" />
       </button>
 
