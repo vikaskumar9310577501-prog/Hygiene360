@@ -471,9 +471,12 @@ function initSchema() {
       )
     `);
     db.exec('CREATE INDEX IF NOT EXISTS idx_toilet_refs ON toilet_reference_photos(toilet_id, kind)');
-    db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('clean_check_min_score', '60', 'Minimum clean score (0-100) for a live toilet photo to be accepted')");
-    db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('clean_check_min_scene', '35', 'Minimum match (0-100) with the toilet reference view')");
-    db.exec("UPDATE system_settings SET value = '35' WHERE key = 'clean_check_min_scene' AND value = '45'");
+    db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('clean_check_min_score', '50', 'Minimum clean score (0-100) for a live toilet photo to be accepted')");
+    db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('clean_check_min_scene', '25', 'Minimum match (0-100) with the toilet reference view')");
+    const relaxedOnce = "NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'photo_match_relaxed_v1')";
+    db.exec(`UPDATE system_settings SET value = '25' WHERE key = 'clean_check_min_scene' AND value IN ('35', '45') AND ${relaxedOnce}`);
+    db.exec(`UPDATE system_settings SET value = '50' WHERE key = 'clean_check_min_score' AND value = '60' AND ${relaxedOnce}`);
+    db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('photo_match_relaxed_v1', '1', 'Internal marker: relaxed photo match defaults applied')");
     db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('sheet_check_min_match', '22', 'Minimum match (0-100) with the check sheet reference photos')");
     db.exec("UPDATE system_settings SET value = '22' WHERE key = 'sheet_check_min_match' AND value = '40'");
     db.exec("INSERT OR IGNORE INTO system_settings (key, value, description) VALUES ('check_sheet_tick_verify', '1', 'Read ticks on the check sheet photo and refuse wrong date / time slot (1 = on, 0 = off)')");

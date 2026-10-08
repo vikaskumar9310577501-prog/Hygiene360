@@ -414,10 +414,19 @@ INSERT INTO system_settings (key, value, description) VALUES
   ('whatsapp_alert_late', '1', 'WhatsApp alert when a cleaning is submitted late'),
   ('whatsapp_alert_summary', '1', 'WhatsApp end-of-day cleaning summary'),
   ('whatsapp_summary_time', '20:00', 'Time (IST) of the end-of-day WhatsApp summary'),
-  ('clean_check_min_score', '60', 'Minimum clean score (0-100) for a live toilet photo to be accepted'),
-  ('clean_check_min_scene', '35', 'Minimum match (0-100) with the toilet reference view'),
+  ('clean_check_min_score', '50', 'Minimum clean score (0-100) for a live toilet photo to be accepted'),
+  ('clean_check_min_scene', '25', 'Minimum match (0-100) with the toilet reference view'),
   ('sheet_check_min_match', '22', 'Minimum match (0-100) with the check sheet reference photos'),
   ('check_sheet_tick_verify', '1', 'Read ticks on the check sheet photo and refuse wrong date / time slot (1 = on, 0 = off)'),
   ('check_sheet_layout', '{"items":["Floor","Wall","Mirror","Wash Basin","Handwash","Urinal","WC","Dustbin"],"timings":["08:00","11:00","13:00","15:00","17:00"],"requireAllItems":true}', 'Printed check sheet columns: item names, timing columns (HH:MM) and whether every item must be ticked'),
   ('issue_target_hours', '4', 'Hours allowed to take action on a new issue')
+ON CONFLICT (key) DO NOTHING;
+
+-- One-time relaxed photo matching: only settings still on the old defaults, never re-applied
+UPDATE system_settings SET value = '25' WHERE key = 'clean_check_min_scene' AND value IN ('35', '45')
+  AND NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'photo_match_relaxed_v1');
+UPDATE system_settings SET value = '50' WHERE key = 'clean_check_min_score' AND value = '60'
+  AND NOT EXISTS (SELECT 1 FROM system_settings WHERE key = 'photo_match_relaxed_v1');
+INSERT INTO system_settings (key, value, description)
+VALUES ('photo_match_relaxed_v1', '1', 'Internal marker: relaxed photo match defaults applied')
 ON CONFLICT (key) DO NOTHING;

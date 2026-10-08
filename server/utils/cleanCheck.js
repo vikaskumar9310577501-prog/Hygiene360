@@ -285,8 +285,8 @@ async function checkSheetAgainstRefs(liveBuffer, refPaths) {
 }
 
 async function checkAgainstRefs(liveBuffer, refPaths) {
-  const minScene = await setting('clean_check_min_scene', 45);
-  const minClean = await setting('clean_check_min_score', 60);
+  const minScene = await setting('clean_check_min_scene', 25);
+  const minClean = await setting('clean_check_min_score', 50);
   const live = await features(liveBuffer, true);
 
   let best = null;

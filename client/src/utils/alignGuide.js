@@ -4,9 +4,10 @@ const MARGIN = 10;
 const STEP = 2;
 const CROPS = [1, 0.85, 0.72];
 
-export const ALIGN_SCORE = 0.45;
-export const NEAR_SCORE = 0.25;
-const CENTER_TOLERANCE = 4;
+// Roughly the same angle is enough; the server still checks cleanliness against the reference
+export const ALIGN_SCORE = 0.33;
+export const NEAR_SCORE = 0.18;
+const CENTER_TOLERANCE = 6;
 // A zoom/shift hint is only given when it is clearly better than the current framing
 const ZOOM_MARGIN = 0.05;
 // Another reference photo must be clearly better before the guide switches to it
@@ -307,9 +308,8 @@ export function evaluateFrame(video, refs, memory = {}) {
   const dy = smooth(memory.dy, r.dy);
   Object.assign(memory, { refIndex, score, dx, dy });
 
-  const centered = Math.abs(dx) <= CENTER_TOLERANCE && Math.abs(dy) <= CENTER_TOLERANCE;
-  // A very strong match is accepted even if the framing is slightly off
-  const aligned = score >= ALIGN_SCORE && ((centered && !r.zoom) || score >= ALIGN_SCORE + 0.12);
+  // Framing hints are advice only; the match score alone decides
+  const aligned = score >= ALIGN_SCORE;
   const hints = [];
   if (score >= NEAR_SCORE && !aligned) {
     if (r.zoom === 'back') hints.push('back');

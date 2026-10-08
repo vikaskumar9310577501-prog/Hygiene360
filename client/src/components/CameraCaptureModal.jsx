@@ -6,8 +6,10 @@ import { Camera, X, Check, AlertTriangle, ShieldCheck, RefreshCw, AlertCircle, S
 
 const MAX_PHOTO_SIDE = 1600;
 // Consecutive aligned frames (sampled every GUIDE_INTERVAL_MS) before the photo is taken automatically
-const AUTO_CAPTURE_STREAK = 3;
-const GUIDE_INTERVAL_MS = 350;
+const AUTO_CAPTURE_STREAK = 2;
+const GUIDE_INTERVAL_MS = 250;
+// After this long the manual button unlocks even without a match; the server still verifies the photo
+const GUIDE_UNLOCK_MS = 8000;
 
 function fitSize(w, h) {
   const scale = Math.min(1, MAX_PHOTO_SIDE / Math.max(w, h));
@@ -39,7 +41,8 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
   const [guide, setGuide] = useState(null);
   const guideMode = guideEnabled && guideRefs.length > 0;
   // Manual capture unlocks once the view is close to the reference; the server still verifies the photo
-  const canCaptureGuided = !!guide && (guide.aligned || guide.score >= guide.alignScore * 0.8);
+  const [guideUnlocked, setGuideUnlocked] = useState(false);
+  const canCaptureGuided = guideUnlocked || (!!guide && (guide.aligned || guide.score >= guide.alignScore * 0.7));
   const isSheetGuide = guideKind === 'CHECK_SHEET';
 
   const videoRef = useRef(null);
@@ -96,6 +99,13 @@ export default function CameraCaptureModal({ isOpen, onClose, sessionId, photoTy
     }
     return () => stopCamera();
   }, [isOpen]);
+
+  useEffect(() => {
+    setGuideUnlocked(false);
+    if (!isOpen || !stream || !guideMode || capturedImage) return;
+    const timer = setTimeout(() => setGuideUnlocked(true), GUIDE_UNLOCK_MS);
+    return () => clearTimeout(timer);
+  }, [isOpen, stream, guideMode, capturedImage]);
 
   // Keep videoRef attached to stream whenever stream is active
   useEffect(() => {
