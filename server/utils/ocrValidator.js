@@ -9,9 +9,14 @@ async function getWorker() {
   if (!tesseractWorker) {
     try {
       // Serverless file systems are read-only outside the temp dir
+      // A failing worker must only disable OCR, never crash the request
+      const errorHandler = err => {
+        console.error('Tesseract worker error:', err?.message || err);
+        tesseractWorker = null;
+      };
       tesseractWorker = process.env.VERCEL
-        ? await createWorker('eng', 1, { cachePath: require('os').tmpdir() })
-        : await createWorker('eng');
+        ? await createWorker('eng', 1, { cachePath: require('os').tmpdir(), errorHandler })
+        : await createWorker('eng', 1, { errorHandler });
     } catch (e) {
       console.warn('Tesseract worker init skipped, using pattern-based date verification:', e.message);
       return null;
