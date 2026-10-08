@@ -113,15 +113,11 @@ export default function QRCardPrintModal({ isOpen, onClose, toilet }) {
               <div style={{ fontSize: '11px', fontWeight: '700', color: '#334155' }}>
                 {toilet?.name}{(qrData?.toilet?.gender || toilet?.gender) ? ` • ${String(qrData?.toilet?.gender || toilet?.gender).toUpperCase() === 'FEMALE' ? 'Female' : 'Male'}` : ''}
               </div>
-              {(qrData?.toilet?.location || toilet?.area_name) && (
-                <div style={{ fontSize: '10px', color: '#64748b', maxWidth: '280px', lineHeight: '1.3' }}>
-                  {qrData?.toilet?.location || [toilet?.building_name, toilet?.block_name, toilet?.floor_name, toilet?.area_name].filter(Boolean).join(' / ')}
-                </div>
-              )}
 
               {/* QR Image */}
               {qrData?.qrDataUrl && (
                 <div style={{
+                  marginTop: '2px',
                   padding: '8px',
                   backgroundColor: '#ffffff',
                   border: '1.5px solid #e2e8f0',
@@ -141,8 +137,8 @@ export default function QRCardPrintModal({ isOpen, onClose, toilet }) {
                 SCAN TO CLEAN OR EVALUATE THIS TOILET
               </div>
 
-              <div style={{ fontSize: '9px', color: '#94a3b8', maxWidth: '270px', lineHeight: '1.3' }}>
-                Housekeeping: cleaning checksheet • Employees: toilet evaluation
+              <div style={{ fontSize: '11px', fontWeight: '700', color: '#0f172a', lineHeight: '1.4' }}>
+                शौचालय की सफाई या मूल्यांकन के लिए स्कैन करें
               </div>
             </div>
           )}
